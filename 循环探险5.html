@@ -1,0 +1,2385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+<title>循环探险 · 肉鸽平台</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a1a; overflow: hidden; touch-action: none; font-family: "Courier New", monospace; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<!-- ========================================================================
+     类库: 本目录下每个文件 = 一个类, 彼此独立作用域, 用全局常量/函数通信
+       physics.js : Ent(物理基类, 必须先加载; 其余类继承它)
+       player.js  : Player
+       enemy.js   : Enemy
+       dragon.js  : Dragon
+       item.js    : Item
+       box.js     : Box
+     双击打开时浏览器会直接加载它们; 直接用 file:// 打开没问题。
+     要生成"单文件版"给手机用: node build.js
+     ======================================================================== -->
+
+<!-- ===== 引擎: 常量 / 地图 / 工具 / 生成 / 战斗 / 界面 / 主循环 ===== -->
+<script>
+// ===== 类库(build.js 内联) =====
+
+/* ---------- physics.js ---------- */
+// ============================================================================
+// physics.js — 物理基类 Ent
+// 所有会动的东西(玩家/怪/箱子)都继承它, 共享同一套 AABB 碰撞。
+// 依赖(由引擎在加载时注入): 全局常量 TILE, GRAVITY, MAX_FALL;
+//                              函数 overlap / solid / solidRect / platformAt
+// ============================================================================
+
+class Ent {
+  constructor(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.vx = 0; this.vy = 0;
+  }
+
+  overlap(o) { return overlap(this, o); }
+
+  // 身体覆盖到的实心格; 同一平台只算一次(用整块矩形推, 不逐格), 否则一脚跨两格会被上一格钉死
+  solidWalls() {
+    const out = [], seen = new Set();
+    const tx1 = Math.floor(this.x / TILE), tx2 = Math.floor((this.x + this.w - 0.001) / TILE);
+    const ty1 = Math.floor(this.y / TILE), ty2 = Math.floor((this.y + this.h - 0.001) / TILE);
+    for (let y = ty1; y <= ty2; y++)
+      for (let x = tx1; x <= tx2; x++) {
+        if (!solid(x, y)) continue;
+        const p = platformAt(x, y);
+        const key = p ? 'p' + p.tx + ',' + p.ty : 't' + x + ',' + y;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(solidRect(x, y));
+      }
+    return out;
+  }
+
+  // 嵌进实心块内部(冲刺/被怪顶进, 速度为 0 时的重叠)时, 从最近的一条边推出去
+  pushOutOfPlatform(wall) {
+    const left = this.x + this.w - wall.x, right = wall.x + wall.w - this.x;
+    const up = this.y + this.h - wall.y, down = wall.y + wall.h - this.y;
+    const m = Math.min(left, right, up, down);
+    if (m === up) { this.y = wall.y - this.h; this.onGround = true; }
+    else if (m === down) this.y = wall.y + wall.h;
+    else if (m === left) this.x = wall.x - this.w;
+    else this.x = wall.x + wall.w;
+  }
+
+  collideH() {
+    for (const wall of this.solidWalls()) {
+      if (!overlap(this, wall)) continue;
+      if (this.vx > 0) this.x = wall.x - this.w;
+      else if (this.vx < 0) this.x = wall.x + wall.w;
+      else this.pushOutOfPlatform(wall);   // vx=0 却重叠: 原写法直接放过, 会卡在方块里
+      this.vx = 0;
+    }
+  }
+
+  collideV(oldY) {
+    // 本帧下落前的脚底位置: 用来区分"从上方落到平台面"和"从侧面撞进平台"
+    const prevBottom = (oldY === undefined ? this.y : oldY) + this.h;
+    for (const wall of this.solidWalls()) {
+      if (!overlap(this, wall)) continue;
+      if (this.vy > 0) {
+        if (prevBottom > wall.y + 2) continue;   // 之前脚底已经在平台表面以下 → 侧撞, 归 collideH 处理
+        this.y = wall.y - this.h; this.vy = 0; this.onGround = true;
+      }
+      else if (this.vy < 0) { this.y = wall.y + wall.h; this.vy = 0; }
+      else this.pushOutOfPlatform(wall);
+    }
+  }
+}
+
+/* ---------- player.js ---------- */
+// ============================================================================
+// player.js — 玩家类 Player(继承 physics.js 的 Ent)
+// 依赖(引擎注入): TILE ROWS DUNGEON_ROWS PW PH GRAVITY MAX_FALL JUMP
+//                  FEEL INVULN_DURATION STOMP_INVULN COLORS COLORS
+//                  input scene dungeonFound
+//                  checkSecret() checkExit() onPlayerDeath() loopStats
+// ============================================================================
+
+class Player extends Ent {
+  constructor(x, y) {
+    super(x, y, PW, PH);
+    this.speed = 4; this.onGround = false; this.hp = 5; this.maxHp = 5;
+    this.invuln = 0; this.alive = true; this.hitFlash = 0; this.stompInvuln = 0;
+    this.powerTimer = 0;
+    // 剑冲刺: 获得道具后可用
+    this.hasDash = false;   // 是否获得冲刺能力
+    this.dashT = 0;         // 冲刺剩余时间(>0=冲刺中)
+    this.dashCd = 0;        // 冲刺冷却(秒), 冷却中不能再次冲刺
+    this.dashDir = 1;       // 冲刺方向
+    this.afterimages = [];  // 残影数组[{x,y,alpha}]
+    this.facing = 1;        // 持久朝向: 1右=-1左(由最后一次按下的方向键决定)
+    // 受击击退(独立于vx, 否则下一帧就被输入覆盖)
+    this.knockT = 0;        // 击退剩余帧数
+    this.knockVx = 0;       // 击退水平速度
+    // 火焰远程技能: 碰道具获得, 按 E/发射键开火
+    this.hasFire = false;
+    this.fireCd = 0;
+    // 滞空跳: 无限跳的漏洞(空中连按可无限爬升)修复 —— 落地后随便跳, 空中只额外给 airHops 次
+    this.airHopsLeft = FEEL.airHops;
+    this.airTime = 0;       // 本次离地后的时间(s), 用于"刚起跳不扣次数"的宽容判定
+    // 连踩: 空中连续踩中怪物累计, 落地清零; 倍率见 comboMul()
+    this.airCombo = 0;
+    this.bestCombo = 0;
+  }
+
+  // 触发冲刺
+  dash() {
+    if (!this.alive || !this.hasDash || this.dashT > 0) return;
+    if (this.dashCd > 0) return;                 // 冷却中不能冲刺
+    this.dashT = FEEL.dashTime;                  // 持续
+    this.dashCd = FEEL.dashCd;                   // 冷却
+    this.dashDir = this.facing;   // 按最近朝向冲刺
+    if (typeof sfx === 'function') sfx('dash');
+  }
+
+  update(dt) {
+    if (!this.alive) return;
+    if (this.dashCd > 0) this.dashCd -= dt;      // 冲刺冷却递减
+    // 冲刺中: 生成残影 + 强制水平高速移动; 仍在下面走重力落地(不return跳过物理)
+    if (this.dashT > 0) {
+      this.dashT -= dt;
+      if (this.afterimages.length < 6) this.afterimages.push({ x: this.x, y: this.y, alpha: 0.5 });
+      this.x += this.dashDir * FEEL.dashSpeed * dt;   // 冲刺速度
+      this.collideH();
+    }
+    // 残影每帧淡出, 移除全透明的
+    for (let i = this.afterimages.length - 1; i >= 0; i--) {
+      this.afterimages[i].alpha -= dt * 1.2;
+      if (this.afterimages[i].alpha <= 0) this.afterimages.splice(i, 1);
+    }
+    let d = 0;
+    if (input.left) d--;
+    if (input.right) d++;
+    // 受击击退优先于输入(持续若干帧, 期间不响应移动键)
+    if (this.knockT > 0) {
+      this.vx = this.knockVx;
+      this.knockT--;
+    } else {
+      this.vx = d * this.speed;
+    }
+    // 首次/最近按下的方向固定朝向(断触松键后 facing 不弹回默认右)
+    if (input.left) this.facing = -1;
+    else if (input.right) this.facing = 1;
+    this.x += this.vx;
+    this.collideH();
+    this.vy += GRAVITY;
+    this.vy = Math.min(this.vy, MAX_FALL);
+    const oldY = this.y;
+    this.y += this.vy;
+    this.onGround = false;
+    this.collideV(oldY);
+    // 站在平台上时脚底可能因为重力每帧往下压 0.5px 而不再与平台"重叠", collideV 就判不到地面了;
+    // 这里补一脚探测: 脚下 1px 内有实心面就算站稳(和地面一样, 站上去不会抖)
+    if (!this.onGround && this.vy >= 0) {
+      // 用"下沉 1px 的自己"和所有实心块做一次重叠检查(平台按整块算)
+      const probe = { x: this.x, y: this.y + 1, w: this.w, h: this.h };
+      const tx1 = Math.floor(probe.x / TILE), tx2 = Math.floor((probe.x + probe.w - 0.001) / TILE);
+      const ty1 = Math.floor(probe.y / TILE), ty2 = Math.floor((probe.y + probe.h - 0.001) / TILE);
+      let landed = null;
+      for (let y = ty1; y <= ty2 && !landed; y++)
+        for (let x = tx1; x <= tx2 && !landed; x++) {
+          if (!solid(x, y)) continue;
+          const wall = solidRect(x, y);
+          if (overlap(probe, wall)) landed = wall;
+        }
+      if (landed) { this.y = landed.y - this.h; this.vy = 0; this.onGround = true; }
+    }
+    if (this.onGround) {
+      if (!this._wasGround && this.airTime > 0.12 && typeof sfx === 'function') sfx('land');   // 从一定高度落地才出声
+      this.airHopsLeft = FEEL.airHops;
+    }
+    this._wasGround = this.onGround;
+    this.airTime = this.onGround ? 0 : this.airTime + dt;
+    const voidY = (scene === 'world' ? ROWS : DUNGEON_ROWS) * TILE + 100;
+    if (this.y > voidY) {
+      const gy = (scene === 'world' ? ROWS : DUNGEON_ROWS) - 1;
+      this.y = gy * TILE - this.h; this.vy = 0; this.onGround = true;
+    }
+    if (this.invuln > 0) this.invuln--;
+    if (this.hitFlash > 0) this.hitFlash -= dt;
+    if (this.stompInvuln > 0) this.stompInvuln--;
+    if (this.powerTimer > 0) this.powerTimer--;
+    if (scene === 'world' && !dungeonFound) checkSecret();
+    if (scene === 'dungeon') checkExit();
+  }
+
+  jump() {
+    if (!this.alive) return;
+    // 落地后无限跳(手感核心); 空中只保留 airHops 次滞空跳.
+    // 原来的"任何时候都能跳"导致空中连按可无限爬升, 10 秒能飞出屏幕几千像素.
+    if (this.onGround || this.airTime <= FEEL.hopRefreshT || this.airHopsLeft > 0) {
+      const _wasAir = !this.onGround;
+      this.vy = FEEL.hopVy;
+      this.onGround = false;
+      if (typeof sfx === 'function') sfx(_wasAir ? 'hop' : 'jump');
+      if (this.airTime > FEEL.hopRefreshT) this.airHopsLeft = Math.max(0, this.airHopsLeft - 1);
+      // 头顶软天花板: 脚底已经飞得比 skyBandH 还高, 放弃这次起跳动力(防止靠反复起跳越飞越远)
+      const headroom = (scene === 'world' ? ROWS : DUNGEON_ROWS) * TILE - FEEL.skyBandH;
+      if (this.y + this.h < headroom) this.vy = Math.max(this.vy, 0);
+    }
+  }
+
+  // srcX: 伤害来源的世界 x 坐标(怪物/龙)。有了它就把玩家往"远离来源"的方向推,
+  // 不再看当前按着哪个方向键 —— 之前按左逃反而被往右推回怪身上.
+  hurt(srcX) {
+    if (this.invuln > 0 || !this.alive) return;
+    if (this.dashT > 0) return;   // 冲刺期间无敌
+    this.hp--; this.invuln = INVULN_DURATION; this.vy = -6; this.hitFlash = 0.12;
+    if (typeof loopStats !== 'undefined') loopStats.hits++;   // 圆桌态度样本
+    // 击退方向: 远离来源; 没有来源(理论上不会发生)就按朝向反推
+    const cx = this.x + this.w / 2;
+    const dir = (typeof srcX === 'number') ? (cx < srcX ? -1 : 1) : -this.facing;
+    this.knockVx = dir * FEEL.hurtKnockback;
+    this.knockT = FEEL.hurtKnockbackT;
+    if (typeof sfx === 'function') sfx('hurt');
+    if (this.hp <= 0) { this.alive = false; onPlayerDeath(); }
+  }
+
+  draw(ox, oy) {
+    if (!this.alive) return;
+    if (this.invuln > 0 && Math.floor(this.invuln / 4) % 2 === 0 && this.dashT <= 0) return;
+    // 冲刺拖尾残影: 先画残影(逐渐淡出)
+    if (this.dashT > 0) {
+      for (const a of this.afterimages) {
+        ctx.globalAlpha = Math.max(0, Math.min(1, a.alpha));
+        ctx.fillStyle = '#00d4ff';
+        ctx.beginPath();
+        ctx.arc(a.x + 15 - ox, a.y + 15 - oy, 30, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      // 玩家冲刺形态: 圆形(半径30)
+      ctx.fillStyle = '#00d4ff';
+      ctx.beginPath();
+      ctx.arc(this.x + 15 - ox, this.y + 15 - oy, 30, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.arc(this.x + 18 - ox, this.y + 12 - oy, 4, 0, Math.PI * 2);
+      ctx.fill();
+      return;
+    }
+    if (this.powerTimer > 0) {
+      ctx.fillStyle = 'rgba(243,156,18,0.35)';
+      ctx.fillRect(this.x - ox - 3, this.y - oy - 3, this.w + 6, this.h + 6);
+    }
+    if (this.hitFlash > 0) { ctx.fillStyle = '#fff'; ctx.fillRect(this.x - ox, this.y - oy, this.w, this.h); return; }
+    ctx.fillStyle = COLORS.player;
+    ctx.fillRect(this.x - ox, this.y - oy, this.w, this.h);
+    const fr = this.facing >= 0;   // 眼睛跟随最近朝向
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(this.x - ox + (fr ? 12 : 4), this.y - oy + 4, 4, 4);
+    ctx.fillRect(this.x - ox + (fr ? 18 : 10), this.y - oy + 4, 4, 4);
+  }
+}
+
+/* ---------- enemy.js ---------- */
+// ============================================================================
+// enemy.js — 怪物类 Enemy(继承 physics.js 的 Ent)
+// 依赖(引擎注入): TILE GRAVITY MAX_FALL ENEMY_SKILL COLORS
+//                  player loopCount timeStopTimer
+// ============================================================================
+
+class Enemy extends Ent {
+  constructor(x, y) {
+    super(x, y, 24, 24);
+    this.startX = x; this.patrolRange = 120; this.baseSpeed = 1.5; this.baseChase = 2.8; this.sight = 360;
+    this.onGround = false; this.hitFlash = 0; this.hp = 2; this.maxHp = 2;
+    this.alive = true;
+    this.state = 'IDLE'; this.locked = false;
+    this.attackRange = 26; this.attackRangeY = 30;   // 进入/维持 ATTACK 的距离阈值与判定阈一致
+    this._pd = Math.random() < 0.5 ? -1 : 1;
+    this._pt = 60 + Math.floor(Math.random() * 120);
+    this._ct = 0; this._at = 0; this.tier = loopCount;
+    // 被冲刺命中的独立计时(秒). 原来复用 hitFlash(受击白闪), 冲刺撞上怪时
+    // hitFlash 被设成 0.25s, 于是"冲刺无敌"期间玩家能在怪头顶反复摩擦不出任何反馈.
+    this.dashHitCd = 0;
+    // 技能: 冲刺加速(ENEMY_SKILL配置)
+    this.skillCd = ENEMY_SKILL.cd;
+    this.skillBoost = 0;
+  }
+
+  // 一帧 AI: 状态的迁移/行为在 ai.js 的行为表里, 这里只做"取意图 + 走物理"
+  // 原来这里是一串 if (state===...) , 加新怪型就得插分支; 现在换成 runBrain()
+  update(dt) {
+    const dx = player.x - this.x, dy = player.y - this.y;
+    const ctx = {
+      dx, dy, dt,
+      playerAlive: player.alive,
+      inSight: Math.abs(dx) <= this.sight && Math.abs(dy) <= 200 && player.alive,
+      curSight: this.sight * (1 + (this.tier - 1) * 0.1),
+      // 原版: let md = this._pd —— 初值永远是巡逻方向, 只有 PURSUE 那段会把它改成朝玩家
+      md: this._pd,
+    };
+    // 速度按"锁定之后、if 链之前"的状态算:
+    //   原版顺序是 [算 dx/dy/inSight] -> [头部锁定, 可能把 IDLE 改成 PURSUE] -> [算 sp] -> [if 链]
+    //   所以"本帧刚被看见"的怪, 同一帧就用追击速度(2.8), 而不是巡逻速度(1.5).
+    //   把头部锁定提到算 sp 之前, 行为上与原版一致.
+    if (!this.locked && ctx.inSight) { this.locked = true; this.state = 'PURSUE'; }
+    const diffT = Math.min((loopCount - 1) * 0.2, 1);
+    let sp = this.state === 'PURSUE'
+      ? this.baseChase * (1 + diffT * 0.4) * (1 + (this.tier - 1) * 0.12)
+      : this.baseSpeed * (1 + diffT * 0.5) * (1 + (this.tier - 1) * 0.08);
+    // 技能计时
+    if (this.skillCd > 0) {
+      this.skillCd -= dt;
+      if (this.skillCd <= 0) { this.skillCd = ENEMY_SKILL.cd; this.skillBoost = ENEMY_SKILL.duration; } // 触发冲刺加速
+    }
+    if (this.skillBoost > 0) {
+      sp *= ENEMY_SKILL.multiplier;   // 加速倍率
+      this.skillBoost -= dt;
+    }
+    // ---- 行为表驱动: 本帧状态 + 该往哪走 ----
+    const r = runBrain(this, ctx);
+    const md = r.dir;
+    // 时停: 时间停留期间怪移速归零(仅怪, 玩家不受影响)
+    if (timeStopTimer > 0) sp = 0;
+    this.x += md * sp;
+    this.collideH();
+    this.vy += GRAVITY; this.vy = Math.min(this.vy, MAX_FALL); this.y += this.vy;
+    this.onGround = false; this.collideV();
+    if (this.hitFlash > 0) this.hitFlash -= dt;
+    if (this.dashHitCd > 0) this.dashHitCd -= dt;
+  }
+
+  draw(ox, oy) {
+    if (this.hitFlash > 0) { ctx.fillStyle = '#fff'; ctx.fillRect(this.x - ox, this.y - oy, this.w, this.h); return; }
+    const weakened = this.hp <= 1;
+    // 冲刺技能释放中: 整体变彩虹色(闪烁), 只影响冲刺技能
+    if (this.skillBoost > 0) {
+      const ph = performance.now() / 120;
+      const cr = 128 + 127 * Math.sin(ph);
+      const cg = 128 + 127 * Math.sin(ph + 2.09);
+      const cb = 128 + 127 * Math.sin(ph + 4.18);
+      ctx.fillStyle = 'rgb(' + cr.toFixed(0) + ',' + cg.toFixed(0) + ',' + cb.toFixed(0) + ')';
+    } else {
+      ctx.fillStyle = this.state === 'ATTACK' ? '#c0392b' : this.state === 'CONFUSED' ? '#888' : weakened ? '#f39c12' : COLORS.enemy;
+    }
+    ctx.fillRect(this.x - ox, this.y - oy, this.w, this.h);
+    ctx.fillStyle = '#333'; ctx.fillRect(this.x - ox, this.y - oy - 8, 24, 3);
+    ctx.fillStyle = this.hp > 1 ? '#e74c3c' : '#f39c12';
+    ctx.fillRect(this.x - ox, this.y - oy - 8, 24 * (this.hp / this.maxHp), 3);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(this.x - ox + 4, this.y - oy + 6, 5, 5);
+    ctx.fillRect(this.x - ox + 15, this.y - oy + 6, 5, 5);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(this.x - ox + 5, this.y - oy + 8, 2, 2);
+    ctx.fillRect(this.x - ox + 16, this.y - oy + 8, 2, 2);
+  }
+}
+
+/* ---------- dragon.js ---------- */
+// ============================================================================
+// dragon.js — 龙 Boss(不继承 Ent: 视觉是椭圆, 判定自己算)
+// 依赖(引擎注入): TILE ROWS canvas camX FEEL player
+// ============================================================================
+
+class Dragon {
+  constructor() {
+    this.SEG_N = 18; this.seg = [];
+    for (let i = 0; i < this.SEG_N; i++) this.seg.push({ x: 0, y: 0, px: 0, py: 0, a: Math.PI });
+    this.hp = 1000; this.maxHp = 1000; this.t = 0; this.state = 'AIM';
+    this.homeX = 500; this.homeY = (ROWS - 1) * TILE - 180;
+    this.breathTm = 0; this.breathCd = 0; this.breathCount = 0; this.maxBreath = 3;
+    this.laser = false; this.laserTm = 0; this.chargeTm = 0;
+    this.laserClip = []; this.laserPtr = 0; this.laserLeft = 0; this.laserReload = 0;
+    this.hitFlash = 0; this.x = this.homeX; this.y = this.homeY; this.ang = Math.PI; this.alive = true;
+    // 碰撞框: 视觉是椭圆, 判定单独给, 和 w/h 解耦
+    this.w = 60; this.h = 40;
+    this.headHalfW = 58;      // 龙头左右判定半宽(对齐视觉头宽)
+    this.headHalfH = 38;      // 龙头上下判定半径
+    this.stompCd = 0;         // 踩头冷却(秒), 防止无限跳连踩瞬间秒杀龙
+    // ===== 巡航: 在"跟随玩家的巡逻区间"内往返, 到边界掉头 =====
+    // 区间大小固定(半宽 patrolHalf), 只有中心 patrolX 随玩家平移 —— 改大小改 patrolHalf
+    this.patrolHalf = 300;    // 巡逻区间半宽(总宽 = 2*patrolHalf)
+    this.patrolX = this.homeX; // 区间中心(平滑跟随玩家)
+    this.dir = 1;             // 巡航朝向: 1右 / -1左
+    this.patrolSpeed = 120;   // 巡航速度(px/s), 改这个调"压迫感"
+    this.catchUpMul = 3.0;    // 龙被甩出区间时的回位加速倍率(玩家全速240px/s, 2.0=240只平速追不上, 3.0=360才追得上)
+    this.followLerp = 2.2;    // 区间中心跟随玩家的收敛速度(越大跟得越紧)
+  }
+
+  spawn(x, y) {
+    this.homeX = x; this.homeY = y; this.x = x; this.y = y;
+    this.patrolX = x; this.dir = 1;
+    for (let i = 0; i < this.SEG_N; i++) {
+      this.seg[i].x = x - i * 26; this.seg[i].y = y;
+      this.seg[i].px = this.seg[i].x; this.seg[i].py = this.seg[i].y; this.seg[i].a = Math.PI;
+    }
+    this.ang = Math.PI; this.state = 'AIM';
+  }
+
+  reloadLaser() {
+    const n = Math.floor(Math.random() * 4) + 2;
+    this.laserClip = [];
+    for (let i = 0; i < n; i++) this.laserClip.push(true);
+    for (let i = 0; i < 2; i++) this.laserClip.push(false);
+    for (let i = this.laserClip.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [this.laserClip[i], this.laserClip[j]] = [this.laserClip[j], this.laserClip[i]];
+    }
+    this.laserLeft = n; this.laserPtr = 0;
+  }
+
+  onScreen() { return this.x > camX - 120 && this.x < camX + canvas.width + 120; }
+
+  update(dt) {
+    if (!this.alive || !player || !player.alive) return;
+    this.t += dt;
+    this.breathTm = Math.max(0, this.breathTm - dt);
+    this.breathCd = Math.max(0, this.breathCd - dt);
+    this.stompCd = Math.max(0, this.stompCd - dt);
+    this.hitFlash = Math.max(0, this.hitFlash - dt);
+    // ===== 巡航: 区间中心平滑跟随玩家(大小不变), 龙在区间内往返, 越界掉头 =====
+    // 旧逻辑是 this.x = this.homeX 每帧钉死原地(站桩炮台), 现在换成真移动
+    const follow = 1 - Math.exp(-this.followLerp * dt);
+    this.patrolX += (player.x - this.patrolX) * follow;
+    const pLeft = this.patrolX - this.patrolHalf;
+    const pRight = this.patrolX + this.patrolHalf;
+    // 玩家把区间带走了, 龙落在区间外 → 加速朝区间内飞(不瞬移)
+    let spd = this.patrolSpeed;
+    if (this.x < pLeft) { this.dir = 1; spd *= this.catchUpMul; }
+    else if (this.x > pRight) { this.dir = -1; spd *= this.catchUpMul; }
+    this.x += this.dir * spd * dt;
+    // 到边界掉头(区间位置在变, 所以每帧都要判)
+    if (this.x >= pRight) this.dir = -1;
+    else if (this.x <= pLeft) this.dir = 1;
+    this.y = this.homeY;   // 高度固定, 不做上下浮动(踩头/吐息判定依赖它)
+    const dTP = Math.hypot(player.x - this.x, player.y - this.y);
+    this.ang = Math.atan2(player.y - this.y, player.x - this.x);
+    const SL = 26;
+    this.seg[0].px = this.seg[0].x; this.seg[0].py = this.seg[0].y;
+    this.seg[0].x = this.x; this.seg[0].y = this.y; this.seg[0].a = this.ang;
+    for (let i = 1; i < this.SEG_N; i++) {
+      const p = this.seg[i - 1], c = this.seg[i];
+      const tx = p.x - Math.cos(p.a) * SL, ty = p.y - Math.sin(p.a) * SL;
+      c.px = c.x; c.py = c.y;
+      const f = 1 - Math.exp(-10 * dt);
+      c.x += (tx - c.x) * f; c.y += (ty - c.y) * f;
+      c.a = Math.atan2(c.y - c.py, c.x - c.px);
+      if (c.x === c.px && c.y === c.py) c.a = p.a;
+      const side = Math.sin(this.t * 2.5 - i * 0.5) * (1.2 + i * 0.12);
+      c.x += -Math.sin(c.a) * side; c.y += Math.cos(c.a) * side;
+    }
+    const hpR = this.hp / this.maxHp;
+    const bCd = hpR < 0.5 ? 2.0 * hpR : 2.0;
+    const vis = this.onScreen();
+    if (this.state === 'AIM') {
+      if (dTP < 300 && this.breathCd <= 0 && vis && Math.random() < 0.02) {
+        this.state = 'BREATH'; this.breathTm = 1.8; this.breathCount++;
+      }
+    }
+    if (this.state === 'BREATH') {
+      const el = 1.8 - this.breathTm;
+      if (el > 0.5) {
+        const atp = Math.atan2(player.y - this.y, player.x - this.x);
+        let da = Math.abs(atp - this.ang); if (da > Math.PI) da = Math.PI * 2 - da;
+        const inS = player.x > camX - 50 && player.x < camX + canvas.width + 50;
+        if (dTP < 300 && da < 0.32 && player.alive && inS) player.hurt(this.x);
+      }
+      if (this.breathTm <= 0) {
+        this.state = 'AIM';
+        if (this.breathCount >= this.maxBreath) { this.breathCount = 0; this.breathCd = bCd; }
+      }
+    }
+    if (this.laserReload > 0) { this.laserReload -= dt; if (this.laserReload <= 0) this.reloadLaser(); }
+    const visL = this.x > camX - 150 && this.x < camX + canvas.width + 150;
+    if (!this.laser && this.laserLeft <= 0 && this.laserReload <= 0 && hpR < 0.5 && visL) this.reloadLaser();
+    if (!this.laser && this.laserLeft > 0 && this.breathCd <= 0 && dTP < 500 && hpR < 0.5 && visL && Math.random() < 0.005) {
+      this.laser = true; this.chargeTm = 1.5;
+    }
+    if (this.laser && this.chargeTm > 0) this.chargeTm -= dt;
+    if (this.laser && this.chargeTm <= 0 && this.laserTm <= 0) {
+      const bul = this.laserClip[this.laserPtr];
+      this.laserPtr = (this.laserPtr + 1) % this.laserClip.length;
+      if (bul) {
+        // 用玩家中心算角度(原来用左上角, 近距离时偏差可达 ~0.1rad, 和 0.09 的容差同量级)
+        const pcx = player.x + player.w / 2, pcy = player.y + player.h / 2;
+        const atp = Math.atan2(pcy - this.y, pcx - this.x);
+        let da = Math.abs(atp - this.ang); if (da > Math.PI) da = Math.PI * 2 - da;
+        const inS = player.x > camX - 50 && player.x < camX + canvas.width + 50;
+        // 近身不吃激光: 原来 da<0.09 没有下限, 玩家贴着龙站(120~200px)必中且躲不开
+        const laserMin = 160;
+        const pdc = Math.hypot(pcx - this.x, pcy - this.y);
+        if (da < 0.09 && pdc >= laserMin && pdc < 600 && player.alive && inS) player.hurt(this.x);
+      }
+      this.laserLeft--; this.laserTm = 0.3;
+    }
+    if (this.laser && this.laserTm > 0) this.laserTm -= dt;
+    if (this.laser && this.laserLeft <= 0 && this.laserTm <= 0) { this.laser = false; this.laserReload = 2.0 + Math.random() * 2.0; }
+    if (dTP < 55 && player.alive) player.hurt(this.x);
+  }
+
+  draw(ox, oy) {
+    if (!this.alive) return;
+    ctx.save(); ctx.translate(this.x - ox, this.y - oy); ctx.rotate(this.ang);
+    for (let i = this.SEG_N - 1; i >= 1; i--) {
+      const s = this.seg[i];
+      const px = s.x - this.x, py = s.y - this.y;
+      const sc = 1 - i / this.SEG_N;
+      const r = 20 * sc + 3;
+      ctx.save(); ctx.translate(px, py); ctx.rotate(s.a - this.ang);
+      ctx.fillStyle = this.hitFlash > 0 ? '#fff' : '#d9dde3';
+      ctx.beginPath(); ctx.ellipse(0, 0, r * 1.35, r, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+    const g = ctx.createLinearGradient(-30, -45, 40, 45);
+    g.addColorStop(0, this.hitFlash > 0 ? '#faa' : '#fff');
+    g.addColorStop(0.45, '#f1f4f7'); g.addColorStop(1, '#aeb8c2');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(0, 0, 58, 38, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#dce3e8'; ctx.beginPath(); ctx.ellipse(12, 15, 40, 19, 0, 0, Math.PI * 2); ctx.fill();
+    const hg = ctx.createRadialGradient(55, -15, 4, 65, 0, 45);
+    hg.addColorStop(0, '#fff'); hg.addColorStop(0.65, '#edf1f4'); hg.addColorStop(1, '#9da8b1');
+    ctx.fillStyle = hg; ctx.beginPath(); ctx.ellipse(65, -3, 38, 30, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#f22'; ctx.beginPath(); ctx.ellipse(65, -12, 7, 5, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    if (this.laser && this.chargeTm <= 0 && this.laserTm > 0) {
+      // 按朝向画, 长度与判定一致(600 内). 原来固定向右画 600px, 朝左时画面和判定对不上.
+      const L = 600;
+      const x0 = this.x - ox + Math.cos(this.ang) * 160;   // 从激光最近距离处起(近身是安全区)
+      const y0 = this.y - oy + Math.sin(this.ang) * 160;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,50,50,0.8)'; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0 + Math.cos(this.ang) * (L - 160), y0 + Math.sin(this.ang) * (L - 160)); ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+/* ---------- item.js ---------- */
+// ============================================================================
+// item.js — 道具类 Item(不继承 Ent: 只有拾取判定, 没有物理)
+// 依赖(引擎注入): COLORS
+// ============================================================================
+
+class Item {
+  constructor(x, y, type) { this.x = x; this.y = y; this.w = 20; this.h = 20; this.type = type; this.bob = Math.random() * Math.PI * 2; this.alive = true; }
+
+  update(dt) { this.bob += dt * 4; }
+
+  draw(ox, oy) {
+    const sx = this.x - ox, sy = this.y - oy + Math.sin(this.bob) * 3;
+    const c = this.type === 'heal' ? COLORS.itemHeal : this.type === 'timeStop' ? '#aa40ff' : this.type === 'swordDash' ? '#4fd8ff' : this.type === 'fireSkill' ? '#ff6622' : COLORS.itemPower;
+    ctx.fillStyle = c; ctx.fillRect(sx, sy, this.w, this.h);
+    ctx.fillStyle = '#fff';
+    if (this.type === 'heal') {
+      ctx.fillRect(sx + 8, sy + 3, 4, 14); ctx.fillRect(sx + 3, sy + 8, 14, 4);
+    } else if (this.type === 'timeStop') {
+      // 时钟图标: 表盘 + 两根指针
+      ctx.fillRect(sx + 4, sy + 4, 12, 12);
+      ctx.fillStyle = '#aa40ff';
+      ctx.fillRect(sx + 9, sy + 6, 2, 5);   // 分针
+      ctx.fillRect(sx + 12, sy + 9, 2, 2);  // 时针
+    } else if (this.type === 'swordDash') {
+      // 剑图标: 斜剑身 + 护手
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(sx + 4, sy + 7, 12, 3);   // 剑身(横)
+      ctx.fillRect(sx + 7, sy + 3, 3, 4);    // 剑尖
+      ctx.fillRect(sx + 16, sy + 6, 3, 6);   // 护手
+    } else if (this.type === 'fireSkill') {
+      // 火焰图标: 橙色外焰+内焰
+      ctx.fillStyle = '#ff8833';
+      ctx.beginPath();
+      ctx.moveTo(sx + 10, sy + 2);
+      ctx.lineTo(sx + 5, sy + 11);
+      ctx.quadraticCurveTo(sx + 2, sy + 15, sx + 7, sy + 17);
+      ctx.quadraticCurveTo(sx + 10, sy + 18, sx + 10, sy + 14);
+      ctx.quadraticCurveTo(sx + 10, sy + 17, sx + 13, sy + 18);
+      ctx.quadraticCurveTo(sx + 18, sy + 17, sx + 15, sy + 10);
+      ctx.quadraticCurveTo(sx + 13, sy + 5, sx + 10, sy + 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffcc66';
+      ctx.beginPath();
+      ctx.arc(sx + 10, sy + 12, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillRect(sx + 8, sy + 2, 4, 12); ctx.fillRect(sx + 4, sy + 4, 12, 4);
+    }
+  }
+}
+
+/* ---------- box.js ---------- */
+// ============================================================================
+// box.js — 箱子(不继承 Ent: 只会往下掉, 不需要水平碰撞)
+// 依赖(引擎注入): TILE GRAVITY MAX_FALL solid solidRect
+// ============================================================================
+
+class Box {
+  constructor(x, y) { this.x = x; this.y = y; this.w = 28; this.h = 28; this.vy = 0; this.onGround = false; }
+
+  update() {
+    this.vy += GRAVITY; this.vy = Math.min(this.vy, MAX_FALL); this.y += this.vy; this.onGround = false;
+    const ty1 = Math.floor(this.y / TILE), ty2 = Math.floor((this.y + this.h - 0.1) / TILE);
+    const tx1 = Math.floor(this.x / TILE), tx2 = Math.floor((this.x + this.w - 0.1) / TILE);
+    for (let y = ty1; y <= ty2; y++)
+      for (let x = tx1; x <= tx2; x++) {
+        if (!solid(x, y)) continue;
+        const w = solidRect(x, y);   // 平台按整块算高度, 免得半截陷进方块
+        if (this.vy > 0) { this.y = w.y - this.h; this.vy = 0; this.onGround = true; }
+        else if (this.vy < 0) { this.y = w.y + w.h; this.vy = 0; }
+      }
+  }
+
+  draw(ox, oy) {
+    const sx = this.x - ox, sy = this.y - oy;
+    ctx.fillStyle = '#8B5E3C'; ctx.fillRect(sx, sy, this.w, this.h);
+    ctx.fillStyle = '#6e4628';
+    ctx.fillRect(sx + 3, sy + 8, this.w - 6, 2);
+    ctx.fillRect(sx + 3, sy + 16, this.w - 6, 2);
+    ctx.strokeStyle = '#4a2f1a'; ctx.lineWidth = 2; ctx.strokeRect(sx, sy, this.w, this.h);
+  }
+}
+
+/* ---------- ai.js ---------- */
+// ============================================================================
+// ai.js — 怪物行为表(Brain): 把 "state + 一长串 if-else" 变成 "state + 一张表"
+//
+// 为什么要改:
+//   原来的 Enemy.update 里 IDLE/PURSUE/CONFUSED/ATTACK 四个状态各写一段 if,
+//   加"会飞的怪""会放魔法的怪"就得再插分支, 函数会越来越长。
+//   现在每个状态的行为登记在 AI_BEHAVIORS 表里, 新怪 = 新名字 + 新的一段行为。
+//
+// 三种扩展方式(从易到难):
+//   1. AI_MOVES[state]        只改移动方式(比如会飞: 目标高度不同)
+//   2. registerBehavior(s,fn) 加一种新状态(比如 CAST: 蓄力放魔法)
+//   3. ARCHETYPES.xx          加一种怪型(换数值/初始状态/行为组合)
+//
+// 关键约定: 取随机数一律走 R() (= Math.random)。
+//           这样才能与重构前的 if-else 版做"同种子逐帧一致"回归。
+// ============================================================================
+
+const AI_STATES = {
+  IDLE: 'IDLE',
+  PURSUE: 'PURSUE',
+  CONFUSED: 'CONFUSED',
+  ATTACK: 'ATTACK',
+};
+
+const R = () => Math.random();
+// 每个状态的 act 收到一个环境对象 o = { e: 敌人, ctx: 本帧上下文, md: 当前移动方向, setMd(v) }
+// 返回下一个状态(与当前相同 = 停在本状态)
+
+// ---------------------------------------------------------------------------
+// 移动表(扩展用): 新怪型如果只是"走得不一样", 在这里登记即可;
+// 现有四种状态的移动方向在各自行为里用 setMd() 给出(与原版逐帧等价)
+// ---------------------------------------------------------------------------
+const AI_MOVES = {
+  [AI_STATES.IDLE]:     { decide(e) { return e._pd; } },   // 巡逻方向
+  [AI_STATES.PURSUE]:   { decide(e, ctx) { return ctx.dx > 0 ? 1 : -1; } },
+  [AI_STATES.CONFUSED]: { decide() { return 0; } },
+  [AI_STATES.ATTACK]:   { decide() { return 0; } },
+};
+
+// ---------------------------------------------------------------------------
+// 状态迁移表: 数据化描述"什么情况下转到什么状态"(when 只是标签, 判定在下面)
+// ---------------------------------------------------------------------------
+const ENEMY_BRAIN = {
+  initial: AI_STATES.IDLE,
+  steps: [
+    { from: AI_STATES.IDLE,     to: AI_STATES.PURSUE,   when: 'sight' },
+    { from: AI_STATES.PURSUE,   to: AI_STATES.ATTACK,   when: 'touch' },
+    { from: AI_STATES.PURSUE,   to: AI_STATES.CONFUSED, when: 'random' },
+    { from: AI_STATES.CONFUSED, to: AI_STATES.PURSUE,   when: 'timer' },
+    { from: AI_STATES.ATTACK,   to: AI_STATES.PURSUE,   when: 'lostTarget' },
+    { from: AI_STATES.ATTACK,   to: AI_STATES.IDLE,     when: 'giveUp' },
+  ],
+};
+
+const AI_BEHAVIORS = {};
+const AI_ORDER = {};          // 兼容旧写法(行为里的 order 字段), 实际排序用下面的 AI_CHAIN
+function registerBehavior(state, def) {
+  AI_BEHAVIORS[state] = def;
+  AI_ORDER[state] = typeof def.order === 'number' ? def.order : 999;
+}
+// 检查顺序: 原版 if 链是 先 PURSUE 后 IDLE(IDLE 永远最后), 新怪型的状态默认插在 IDLE 之前
+function aiChain() {
+  return AI_CHAIN.filter(k => AI_BEHAVIORS[k])
+    .concat(Object.keys(AI_BEHAVIORS).filter(k => AI_CHAIN.indexOf(k) < 0));
+}
+
+// IDLE: 巡逻; 看见玩家立刻"咬住"(locked=true, 只触发一次)并转 PURSUE
+registerBehavior(AI_STATES.IDLE, {
+  order: 30,
+  // 巡逻: 计时到点换向 + 到巡逻边界掉头(和原版 IDLE 那段一字不差)
+  act(o) {
+    // 注意: 原版 IDLE 段只改 _pd(下一步的巡逻方向), 不改 md ——
+    // 本帧实际位移用的是"进入 IDLE 段之前"的 md(通常是上一帧的 _pd)。
+    // 早期版本这里多写了一行 setMd(e._pd), 导致掉头那一帧方向反了。
+    const { e } = o;
+    e._pt--;
+    if (e._pt <= 0) { e._pd = R() < 0.5 ? -1 : 1; e._pt = 60 + Math.floor(R() * 120); }
+    if (e.x - e.startX > e.patrolRange) e._pd = -1;
+    else if (e.startX - e.x > e.patrolRange) e._pd = 1;
+    return AI_STATES.IDLE;
+  },
+});
+
+// PURSUE: 贴身进 ATTACK; 偶尔走神(顺序: 先判贴身, 再判走神 —— 与原版一致)
+registerBehavior(AI_STATES.PURSUE, {
+  order: 10,      // 原版 if 链顺序: PURSUE -> CONFUSED -> ATTACK -> IDLE
+  act(o) {
+    const { e, ctx, setMd } = o;
+    setMd(ctx.dx > 0 ? 1 : -1);                       // 朝玩家
+    // 贴身进 ATTACK. 原版是"非 else-if 的 if 链": 这里把 state 改成 ATTACK 之后,
+    // 后面"再抽一次骰子决定要不要 CONFUSED"那一行仍然会执行(只是此时 state 已不是 PURSUE,
+    // 所以骰子结果不会生效, 但随机数照样被消耗) —— 为了同种子逐帧可复现, 必须照原样消费.
+    if (Math.abs(ctx.dx) < 26 && Math.abs(ctx.dy) < 30) {
+      e._at = 36; setMd(0);
+      if (R() < 0.08 * ctx.dt) e._ct = 30 + R() * 30;   // 结果被丢弃, 只消耗随机数(与原版一致)
+      return AI_STATES.ATTACK;
+    }
+    // 注意: 这一步是"再抽一次骰子决定要不要 CONFUSED", 没抽中就保持 PURSUE,
+    // 不能写成"没抽中则保持当前状态"那样直接 return 当前状态 —— 否则下面 IDLE 的巡逻逻辑会被跳过
+    if (R() < 0.08 * ctx.dt) { e._ct = 30 + R() * 30; return AI_STATES.CONFUSED; }   // 原版是 30+rand*30(小数)
+    return AI_STATES.PURSUE;
+  },
+});
+
+// CONFUSED: 呆 N 帧
+registerBehavior(AI_STATES.CONFUSED, {
+  order: 20,
+  // 原版语义: 每帧 _ct--; 减到 0 就切回 PURSUE(该帧还没真正走到就结束)
+  // 注意: 原版这里不会动 locked —— 只有 ATTACK 放弃追击时才会清 locked
+  act(o) {
+    const { e, setMd } = o;
+    setMd(0);
+    e._ct--;
+    if (e._ct <= 0) return AI_STATES.PURSUE;
+    return AI_STATES.CONFUSED;
+  },
+});
+
+// ATTACK: 只在仍贴着玩家时维持; 玩家跑了/被击退就脱战(不再永久冻住)
+registerBehavior(AI_STATES.ATTACK, {
+  order: 40,
+  act(o) {
+    const { e, ctx, setMd } = o;
+    setMd(0);
+    e._at--;
+    const stillClose = Math.abs(ctx.dx) < e.attackRange && Math.abs(ctx.dy) < e.attackRangeY;
+    if (e._at <= 0 || !stillClose || !ctx.playerAlive) {
+      if (ctx.playerAlive && Math.abs(ctx.dx) < ctx.curSight && Math.abs(ctx.dy) <= 200) return AI_STATES.PURSUE;
+      e.locked = false; e._pt = 60 + Math.floor(R() * 120);
+      return AI_STATES.IDLE;
+    }
+    return AI_STATES.ATTACK;
+  },
+});
+
+// ---------------------------------------------------------------------------
+// 怪型表: 加"会飞的怪""会放魔法的怪"就在这里加一行
+// ---------------------------------------------------------------------------
+const ARCHETYPES = {
+  walker: { speed: { base: 1.5, chase: 2.8 }, sight: 360, skill: true },   // 当前唯一怪型
+  // flyer: { speed: { base: 2.0, chase: 3.2 }, sight: 420, skill: false },
+  // mage:  { speed: { base: 1.0, chase: 1.4 }, sight: 500, skill: false },
+};
+
+// ---------------------------------------------------------------------------
+// 跑一帧 AI, 返回 { dir, state }
+// ctx.md: 本帧移动到现在的"默认方向"(原版 let md = this._pd, PURSUE 分支会先把它改成朝玩家)
+// 判定顺序与原 if-else 版完全一致, 随机数取用位置也一致 → 可做同种子回归
+// ---------------------------------------------------------------------------
+function runBrain(e, ctx) {
+  // 原版是一条 if 链, 这里逐行重放(顺序 = AI_CHAIN):
+  //   0. 开头独立一行: 没咬住 + 看见玩家 -> 咬住, 并把状态置成 PURSUE(只改状态)
+  //   1. PURSUE / CONFUSED / ATTACK / IDLE 四段, 当前状态匹配就执行
+  //   2. 某段把状态改了就"从头再来"(原版后面的段看到的是新状态), 一圈无迁移则本帧结束
+  // 新增怪型: 往 AI_BEHAVIORS / AI_MOVES 加条目, 不用改这里.
+  const CHAIN = aiChain();
+  let st = e.state;
+  if (!AI_BEHAVIORS[st]) st = ENEMY_BRAIN.initial;
+  let md = ctx.md != null ? ctx.md : e._pd;      // 原版: let md = this._pd
+  const o = { e, ctx, get md() { return md; }, setMd(v) { md = v; } };
+  // 从头重放时, 只从"让状态刚变掉的那一段之后"继续检查 —— 这正对应原版 if 链:
+  // 状态在位置 i 被改掉后, 原版只会继续往下看 i+1..末尾的 if, 不会回头再执行 i 本身
+  // (早期版本每次都从链头重跑, 导致 ATTACK 脱战改成 PURSUE 之后, 同一帧又执行了一遍
+  //  PURSUE 段, 把刚减到 0 的 _at 又设成 36 → 怪永远脱不了战)
+  for (let pass = 0, from = 0; pass < 10; pass++) {
+    // 第 0 行(独立于各状态): 没咬住 + 看见玩家 -> 咬住并把状态置成 PURSUE
+    if (!e.locked && ctx.inSight) { e.locked = true; st = AI_STATES.PURSUE; from = 0; }
+    let moved = false, nextFrom = 0;
+    for (let i = from; i < CHAIN.length; i++) {
+      if (st !== CHAIN[i]) continue;
+      const beh = AI_BEHAVIORS[st];
+      const r = beh ? beh.act(o) : st;
+      if (r !== st) { st = r; moved = true; nextFrom = i + 1; break; }
+    }
+    md = o.md;
+    if (!moved) break;
+    from = nextFrom;
+  }
+  e.state = st;
+  return { dir: md, state: st };
+}
+
+// 原版 if 链的检查顺序(改顺序会改变同帧内的判定结果, 别随便动)
+const AI_CHAIN = [AI_STATES.PURSUE, AI_STATES.CONFUSED, AI_STATES.ATTACK, AI_STATES.IDLE];
+
+/* ---------- audio.js ---------- */
+// ============================================================================
+// audio.js — Web Audio 合成器: 不加载任何音频文件, 全靠振荡器现算
+//
+// 用法:
+//   AUDIO.unlock()      在第一次用户手势(点击/按键)里调用, 解除浏览器静音
+//   AUDIO.play('jump')  播放一个音效(带限流, 防止密集帧糊成爆音)
+//   AUDIO.setMute(true) 静音/恢复(设置会记住)
+//
+// 设计要点:
+//   1. 每个音效 = 一串"音符"(osc + 包络), 用数据描述, 加音效只加一行数据
+//   2. 所有声音必须挂在 master 上, master 音量压到 0.25 —— 手机外放不刺耳
+//   3. 同一音效 50ms 内不重复(冲刺每帧都在命中, 不限流会炸)
+//   4. 没有 AudioContext 的环境(比如无头测试)全部静默降级, 绝不抛错
+// ============================================================================
+
+const AUDIO = (() => {
+  let ac = null, master = null, noiseBuf = null;
+  let muted = false, ready = false;
+  const lastAt = {};              // 限流: 音效名 → 上次播放时间
+  const MIN_GAP = 0.05;           // 秒
+  const MAX_VOICES = 24;          // 同时发声上限
+  let voices = 0;
+
+  function ensure() {
+    if (ac) return ac;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return null;
+    try {
+      ac = new Ctor();
+      master = ac.createGain();
+      master.gain.value = muted ? 0 : 0.25;
+      master.connect(ac.destination);
+    } catch (err) { ac = null; return null; }
+    return ac;
+  }
+
+  // 白噪声(爆炸/受伤用): 只生成一次, 复用
+  // 注意: 这里(以及整个音频模块)绝对不能用 Math.random ——
+  // 游戏逻辑也吃同一个 Math.random, 音频若跟着抽数会把怪物的随机序列整条推歪,
+  // 表现为"加了音效之后怪的行为全变了". 所以噪声用自带的 xorshift 种子生成.
+  let noiseSeed = 0x9e3779b9;
+  function noiseRand() {
+    noiseSeed ^= noiseSeed << 13; noiseSeed ^= noiseSeed >>> 17; noiseSeed ^= noiseSeed << 5;
+    return ((noiseSeed >>> 0) / 4294967296);
+  }
+  function noise() {
+    if (noiseBuf) return noiseBuf;
+    const n = Math.floor(ac.sampleRate * 0.4);
+    noiseBuf = ac.createBuffer(1, n, ac.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (noiseRand() * 2 - 1) * (1 - i / n);
+    return noiseBuf;
+  }
+
+  // 一个"音符": 振荡器 + 频率滑移 + ADSR 包络
+  // o = { type, f0, f1, dur, vol, delay, slide }  slide: 'exp'|'lin'|null
+  function note(o) {
+    const t0 = ac.currentTime + (o.delay || 0);
+    const dur = o.dur || 0.1;
+    const g = ac.createGain();
+    const vol = (o.vol == null ? 0.5 : o.vol);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), t0 + Math.min(0.02, dur * 0.3));
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    g.connect(master);
+    let src;
+    if (o.type === 'noise') {
+      src = ac.createBufferSource();
+      src.buffer = noise();
+      if (o.f0 || o.f1) {
+        const bp = ac.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.setValueAtTime(o.f0 || 800, t0);
+        if (o.f1) bp.frequency.exponentialRampToValueAtTime(Math.max(30, o.f1), t0 + dur);
+        bp.Q.value = o.q || 1.2;
+        src.connect(bp); bp.connect(g);
+      } else src.connect(g);
+    } else {
+      src = ac.createOscillator();
+      src.type = o.type || 'square';
+      src.frequency.setValueAtTime(Math.max(20, o.f0 || 440), t0);
+      if (o.f1) {
+        if (o.slide === 'lin') src.frequency.linearRampToValueAtTime(Math.max(20, o.f1), t0 + dur);
+        else src.frequency.exponentialRampToValueAtTime(Math.max(20, o.f1), t0 + dur);
+      }
+      src.connect(g);
+    }
+    src.start(t0);
+    src.stop(t0 + dur + 0.02);
+    voices++;
+    src.onended = () => { voices = Math.max(0, voices - 1); };
+  }
+
+  // ---- 音效表(数据): 加音效 = 加一条 ----
+  const SFX = {
+    jump:      [{ type: 'square',   f0: 300, f1: 620, dur: 0.11, vol: 0.22 }],
+    hop:       [{ type: 'square',   f0: 460, f1: 760, dur: 0.09, vol: 0.18 }],
+    land:      [{ type: 'noise',    f0: 200, f1: 90,  dur: 0.07, vol: 0.12 }],
+    stomp:     [{ type: 'square',   f0: 520, f1: 180, dur: 0.10, vol: 0.30 },
+                { type: 'triangle', f0: 220, f1: 90,  dur: 0.14, vol: 0.25 }],
+    shoot:     [{ type: 'sawtooth', f0: 760, f1: 240, dur: 0.07, vol: 0.16 }],
+    dash:      [{ type: 'noise',    f0: 1400, f1: 260, dur: 0.16, vol: 0.20, q: 0.8 }],
+    hurt:      [{ type: 'sawtooth', f0: 200, f1: 55,  dur: 0.22, vol: 0.34 },
+                { type: 'noise',    f0: 600, f1: 120, dur: 0.18, vol: 0.18 }],
+    hit:       [{ type: 'square',   f0: 900, f1: 400, dur: 0.04, vol: 0.12 }],
+    kill:      [{ type: 'square',   f0: 240, f1: 60,  dur: 0.18, vol: 0.26 },
+                { type: 'noise',    f0: 500, f1: 100, dur: 0.20, vol: 0.22 }],
+    pickup:    [{ type: 'triangle', f0: 660, dur: 0.08, vol: 0.26 },
+                { type: 'triangle', f0: 990, dur: 0.12, vol: 0.24, delay: 0.07 }],
+    special:   [{ type: 'triangle', f0: 523, dur: 0.09, vol: 0.26 },
+                { type: 'triangle', f0: 659, dur: 0.09, vol: 0.26, delay: 0.08 },
+                { type: 'triangle', f0: 784, dur: 0.16, vol: 0.26, delay: 0.16 }],
+    loopclear: [{ type: 'square', f0: 523, dur: 0.10, vol: 0.24 },
+                { type: 'square', f0: 659, dur: 0.10, vol: 0.24, delay: 0.09 },
+                { type: 'square', f0: 784, dur: 0.10, vol: 0.24, delay: 0.18 },
+                { type: 'square', f0: 1047, dur: 0.24, vol: 0.26, delay: 0.27 }],
+    voteYes:   [{ type: 'triangle', f0: 660, dur: 0.07, vol: 0.20 },
+                { type: 'triangle', f0: 880, dur: 0.11, vol: 0.20, delay: 0.06 }],
+    voteNo:    [{ type: 'square', f0: 330, f1: 180, dur: 0.16, vol: 0.20 }],
+    councilYes:[{ type: 'triangle', f0: 784, dur: 0.12, vol: 0.26 },
+                { type: 'triangle', f0: 1047, dur: 0.26, vol: 0.26, delay: 0.11 }],
+    councilNo: [{ type: 'sawtooth', f0: 300, f1: 110, dur: 0.35, vol: 0.28 },
+                { type: 'noise', f0: 400, f1: 90, dur: 0.30, vol: 0.16 }],
+    councilEven:[{ type: 'triangle', f0: 440, dur: 0.14, vol: 0.22 },
+                { type: 'triangle', f0: 440, dur: 0.14, vol: 0.22, delay: 0.16 }],
+    death:     [{ type: 'sawtooth', f0: 440, f1: 60, dur: 0.6, vol: 0.30 },
+                { type: 'noise',    f0: 300, f1: 60, dur: 0.5, vol: 0.20 }],
+    start:     [{ type: 'square', f0: 392, dur: 0.09, vol: 0.22 },
+                { type: 'square', f0: 587, dur: 0.14, vol: 0.22, delay: 0.08 }],
+    timeslow:  [{ type: 'triangle', f0: 880, f1: 220, dur: 0.5, vol: 0.20 }],
+    door:      [{ type: 'triangle', f0: 300, f1: 520, dur: 0.18, vol: 0.20 }],
+  };
+
+  function play(name) {
+    if (muted) return;
+    const seq = SFX[name];
+    if (!seq) return;
+    if (!ensure()) return;
+    if (ac.state === 'suspended') { unlock(); if (ac.state === 'suspended') return; }   // 浏览器策略: 没手势前不出声
+    const now = ac.currentTime;
+    if (lastAt[name] != null && now - lastAt[name] < MIN_GAP) return;
+    if (voices > MAX_VOICES) return;
+    lastAt[name] = now;
+    ready = true;
+    for (const o of seq) { try { note(o); } catch (e) { /* 单个音效失败不影响游戏 */ } }
+  }
+
+  function unlock() {
+    if (!ensure()) return;
+    if (ac.state === 'suspended') ac.resume().catch(() => {});
+  }
+
+  function setMute(m) {
+    muted = !!m;
+    if (master) master.gain.value = muted ? 0 : 0.25;
+  }
+
+  return {
+    play, unlock, setMute,
+    get muted() { return muted; },
+    get ready() { return ready; },
+    get ctx() { return ac; },
+    toggleMute() { setMute(!muted); return muted; },
+    SFX, MIN_GAP,
+  };
+})();
+
+// ---------------------------------------------------------------------------
+// sfx.js 的内容(放在同一文件里, 保证 build.js 内联时不多一个脚本标签):
+// 把游戏事件 → 合成器音效
+// 只是"事件转发", 不含任何判定, 出错就静默 —— 宁可没声音, 不能卡住游戏
+// ---------------------------------------------------------------------------
+const SFX_HOOK = {
+  play(name) {
+    try {
+      if (typeof localStorage !== 'undefined' && localStorage.getItem('loopgame_mute') === '1') return;
+      AUDIO.play(name);
+    } catch (e) { /* 无声降级 */ }
+  },
+  unlock() { try { AUDIO.unlock(); } catch (e) {} },
+  toggle() {
+    try {
+      const m = AUDIO.toggleMute();
+      localStorage.setItem('loopgame_mute', m ? '1' : '0');
+      return m;
+    } catch (e) { return false; }
+  },
+  init() {
+    try {
+      // 页面加载时插一个"音频已授权"的引导: 第一次点击/按键后解锁
+      const kick = () => { SFX_HOOK.unlock(); };
+      window.addEventListener('pointerdown', kick, { once: true });
+      window.addEventListener('keydown', kick, { once: true });
+      // 记住静音状态
+      if (typeof localStorage !== 'undefined' && localStorage.getItem('loopgame_mute') === '1') AUDIO.setMute(true);
+    } catch (e) {}
+  },
+};
+if (typeof window !== 'undefined') SFX_HOOK.init();
+
+/* ---------- council-ui.js ---------- */
+// ============================================================================
+// council-ui.js — 圆桌投票可视化
+//
+// 原来: councilRound 的结论只在左上角 HUD 显示 4 秒文字。
+// 现在: 结算那一刻, 屏幕中央画出圆桌 + 5 个村民头像(含 1 个隐狼),
+//       每个人的票先转圈, 然后逐个亮出 ✅ 同意 / ❌ 反对, 最后出结论横幅。
+//
+// 关键设计(不能踩的坑):
+//   1. 纯视觉: 只在 draw() 里读 COUNCIL 数据, 绝不改 att/votes/kind,
+//      也不消耗 Math.random —— 保证不影响游戏确定性(回归测试要靠这个)
+//   2. 错时: 动画用真实时间(performance.now), 不占游戏 dt
+//   3. 不进 loop 竞争: 用 requestAnimationFrame 自己画, 画在游戏画面之上
+//      画布是同一个 #game, 所以坐标直接用屏幕坐标
+//   4. 玩家死亡/重开时被强制收掉, 不会挡住 GAME OVER
+// ============================================================================
+
+const COUNCIL_UI = (() => {
+  const DUR = { in: 0.45, flip: 0.22, gap: 0.13, hold: 3.2, out: 0.45 };
+  let show = null;          // { startAt, att, members, kind, text, v }
+  let raf = 0;
+  let canvas = null;
+
+  function layout() {
+    const W = canvas.width, H = canvas.height;
+    const cx = W / 2, cy = H / 2;
+    const R = Math.max(90, Math.min(W, H) * 0.20);      // 圆桌半径
+    return { W, H, cx, cy, R };
+  }
+
+  // ---- 画一个村民头像(纯 canvas, 无图片) ----
+  // i: 序号, wolf: 是否隐狼(结算后才露馅), revealed: 是否已亮票
+  function drawMember(c, x, y, r, i, c2) {
+    const n = c2.i;
+    // 头
+    const skin = ['#f2c79a', '#e8b98a', '#f7d3ae', '#dfae7e', '#efc396'];
+    c.fillStyle = skin[n % skin.length];
+    c.beginPath(); c.arc(x, y, r * 0.62, 0, Math.PI * 2); c.fill();
+    // 头发(每人形状不同, 一眼能分清)
+    c.fillStyle = ['#3a2a1a', '#6b4a2a', '#20242e', '#8a5a2a', '#4a3a5a'][n % 5];
+    c.beginPath();
+    if (n % 3 === 0) c.arc(x, y - r * 0.12, r * 0.64, Math.PI, Math.PI * 2);
+    else if (n % 3 === 1) { c.arc(x, y - r * 0.05, r * 0.68, Math.PI * 1.05, Math.PI * 1.95); }
+    else { c.arc(x, y - r * 0.02, r * 0.60, Math.PI * 1.15, Math.PI * 1.85); }
+    c.fill();
+    // 眼睛(隐狼: 结算后变红)
+    const wolfShow = c2.wolf && c2.revealed;
+    c.fillStyle = wolfShow ? '#ff2222' : '#222';
+    c.beginPath(); c.arc(x - r * 0.22, y - r * 0.05, r * 0.075, 0, Math.PI * 2); c.fill();
+    c.beginPath(); c.arc(x + r * 0.22, y - r * 0.05, r * 0.075, 0, Math.PI * 2); c.fill();
+    // 嘴: 同意=笑 反对=撇嘴 未知=平
+    c.strokeStyle = wolfShow ? '#ff2222' : '#5a3a2a';
+    c.lineWidth = Math.max(1.5, r * 0.09);
+    c.beginPath();
+    if (c2.vote === 1) c.arc(x, y + r * 0.12, r * 0.24, Math.PI * 0.15, Math.PI * 0.85);
+    else if (c2.vote === -1) c.arc(x, y + r * 0.38, r * 0.24, Math.PI * 1.2, Math.PI * 1.8);
+    else c.moveTo(x - r * 0.18, y + r * 0.30), c.lineTo(x + r * 0.18, y + r * 0.30);
+    c.stroke();
+    // 名字
+    c.fillStyle = '#e8e8e8';
+    c.font = 'bold ' + Math.round(r * 0.34) + 'px sans-serif';
+    c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillText(c2.name, x, y + r * 0.98);
+  }
+
+  function drawCheck(c, x, y, s) {
+    c.strokeStyle = '#2ecc71'; c.lineWidth = Math.max(3, s * 0.18); c.lineCap = 'round';
+    c.beginPath(); c.moveTo(x - s * 0.45, y); c.lineTo(x - s * 0.1, y + s * 0.38); c.lineTo(x + s * 0.5, y - s * 0.42); c.stroke();
+  }
+  function drawCross(c, x, y, s) {
+    c.strokeStyle = '#e94560'; c.lineWidth = Math.max(3, s * 0.18); c.lineCap = 'round';
+    c.beginPath();
+    c.moveTo(x - s * 0.4, y - s * 0.4); c.lineTo(x + s * 0.4, y + s * 0.4);
+    c.moveTo(x + s * 0.4, y - s * 0.4); c.lineTo(x - s * 0.4, y + s * 0.4);
+    c.stroke();
+  }
+
+  function draw() {
+    if (!show) return;
+    raf = 0;
+    const ctx2 = canvas && canvas.getContext && canvas.getContext('2d');
+    if (!ctx2) { show = null; return; }
+    const t = (performance.now() - show.startAt) / 1000;
+    const L = layout();
+    const n = show.members.length;
+    const totalIn = DUR.in + n * (DUR.flip + DUR.gap);
+    const endAt = totalIn + DUR.hold + DUR.out;
+    if (t > endAt) { show = null; return; }
+
+    const alpha = t < DUR.in ? t / DUR.in : (t > endAt - DUR.out ? Math.max(0, (endAt - t) / DUR.out) : 1);
+    ctx2.save();
+    ctx2.globalAlpha = alpha;
+
+    // 背景压暗
+    ctx2.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx2.fillRect(0, 0, L.W, L.H);
+
+    const pop = Math.min(1, t / DUR.in);
+    const ease = 1 - Math.pow(1 - pop, 3);
+    const R = L.R * (0.6 + 0.4 * ease);
+
+    // 圆桌
+    ctx2.fillStyle = 'rgba(90,60,35,0.92)';
+    ctx2.beginPath(); ctx2.arc(L.cx, L.cy, R, 0, Math.PI * 2); ctx2.fill();
+    ctx2.strokeStyle = '#d4a25a'; ctx2.lineWidth = 4;
+    ctx2.beginPath(); ctx2.arc(L.cx, L.cy, R, 0, Math.PI * 2); ctx2.stroke();
+    ctx2.strokeStyle = 'rgba(255,255,255,0.12)'; ctx2.lineWidth = 1;
+    ctx2.beginPath(); ctx2.arc(L.cx, L.cy, R * 0.72, 0, Math.PI * 2); ctx2.stroke();
+
+    // 标题
+    ctx2.fillStyle = '#ffd24a';
+    ctx2.font = 'bold ' + Math.round(Math.max(16, R * 0.22)) + 'px sans-serif';
+    ctx2.textAlign = 'center'; ctx2.textBaseline = 'middle';
+    ctx2.globalAlpha = alpha * Math.min(1, t / 0.3);
+    ctx2.fillText('圆 桌 投 票', L.cx, L.cy - R * 0.42);
+    ctx2.fillStyle = '#bbb';
+    ctx2.font = Math.round(Math.max(12, R * 0.14)) + 'px sans-serif';
+    ctx2.fillText('第 ' + show.loop + ' 圈结算', L.cx, L.cy - R * 0.42 + R * 0.22);
+    ctx2.globalAlpha = alpha;
+
+    // 头像环绕圆桌
+    const mr = Math.max(16, R * 0.20);
+    for (let i = 0; i < n; i++) {
+      const ang = -Math.PI / 2 + i * (Math.PI * 2 / n);
+      const mx = L.cx + Math.cos(ang) * R * 0.98;
+      const my = L.cy + Math.sin(ang) * R * 0.98;
+      const flipAt = DUR.in + i * (DUR.flip + DUR.gap);
+      const c2 = show.members[i];
+      const revoked = t >= flipAt + DUR.flip;
+      // 亮票时配一声短音(只报"刚亮出"那一帧, 不影响游戏)
+    if (revoked && !c2.sounded) { c2.sounded = true; if (typeof SFX_HOOK !== 'undefined') SFX_HOOK.play(c2.vote === 1 ? 'voteYes' : c2.vote === -1 ? 'voteNo' : 'hit'); }
+    // 亮票时轻微弹一下
+      const bounce = revoked ? 1 + 0.12 * Math.max(0, 1 - (t - flipAt - DUR.flip) / 0.2) : 1;
+      ctx2.save();
+      ctx2.translate(mx, my); ctx2.scale(bounce, bounce); ctx2.translate(-mx, -my);
+      // 底盘
+      ctx2.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx2.beginPath(); ctx2.arc(mx, my, mr * 1.12, 0, Math.PI * 2); ctx2.fill();
+      drawMember(ctx2, mx, my, mr, i, {
+        i, name: c2.name, vote: revoked ? c2.vote : 0,
+        wolf: c2.wolf, revealed: revoked && show.revealWolf,
+      });
+      // 票: 亮出后浮在头像右上
+      if (revoked) {
+        const k = Math.min(1, (t - flipAt - DUR.flip) / 0.15);
+        ctx2.globalAlpha = alpha * k;
+        const bx = mx + mr * 0.85, by = my - mr * 0.85, bs = mr * 0.62;
+        ctx2.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx2.beginPath(); ctx2.arc(bx, by, bs, 0, Math.PI * 2); ctx2.fill();
+        if (c2.vote === 1) drawCheck(ctx2, bx, by, bs * 1.1);
+        else if (c2.vote === -1) drawCross(ctx2, bx, by, bs * 1.1);
+        else { ctx2.fillStyle = '#aaa'; ctx2.font = 'bold ' + Math.round(bs * 1.1) + 'px sans-serif'; ctx2.fillText('?', bx, by + 1); }
+        ctx2.globalAlpha = alpha;
+      }
+      ctx2.restore();
+    }
+
+    // 中央计票
+    if (t >= totalIn - 0.15) {
+      const k = Math.min(1, (t - totalIn + 0.15) / 0.3);
+      ctx2.globalAlpha = alpha * k;
+      const fs = Math.round(Math.max(20, R * 0.30));
+      ctx2.font = 'bold ' + fs + 'px sans-serif';
+      const yes = show.members.filter(m => m.vote === 1).length;
+      const no = show.members.filter(m => m.vote === -1).length;
+      ctx2.fillStyle = '#2ecc71'; ctx2.fillText(String(yes), L.cx - fs * 0.7, L.cy + R * 0.02);
+      ctx2.fillStyle = '#888'; ctx2.font = 'bold ' + Math.round(fs * 0.7) + 'px sans-serif';
+      ctx2.fillText(':', L.cx, L.cy + R * 0.02);
+      ctx2.fillStyle = '#e94560'; ctx2.font = 'bold ' + fs + 'px sans-serif';
+      ctx2.fillText(String(no), L.cx + fs * 0.7, L.cy + R * 0.02);
+      // 结论
+      ctx2.globalAlpha = alpha;
+      ctx2.font = 'bold ' + Math.round(Math.max(14, R * 0.17)) + 'px sans-serif';
+      ctx2.fillStyle = show.kind === 'reward' ? '#2ecc71' : show.kind === 'penalty' ? '#e94560' : '#cccccc';
+      ctx2.fillText(show.title, L.cx, L.cy + R * 0.30);
+      if (show.wolfShown) {
+        ctx2.fillStyle = '#ff8888';
+        ctx2.font = Math.round(Math.max(11, R * 0.12)) + 'px sans-serif';
+        ctx2.fillText('隐狼被火光照出来了', L.cx, L.cy + R * 0.50);
+      }
+    }
+    ctx2.restore();
+
+    raf = requestAnimationFrame(draw);
+  }
+
+  // councilRound 结算时调用
+  function trigger(payload) {
+    try {
+      if (typeof canvas === 'undefined' || !canvas) { canvas = document.getElementById('game'); }
+      if (!canvas) return;
+      const att = payload.att || {};
+      const members = [];
+      for (let i = 0; i < (payload.members || 5); i++) {
+        const name = '村民' + (i + 1);
+        members.push({ name, vote: att[name] || 0, wolf: i === 2 });   // 与 engines 的"隐狼固定第 3 位"一致
+      }
+      show = {
+        startAt: performance.now(),
+        members,
+        kind: payload.kind,
+        // 引擎里 kind 只能是 reward / penalty / none, 平票要按 none 处理
+        title: payload.kind === 'reward' ? '放行 — 村民支持你'
+             : payload.kind === 'penalty' ? '加码 — 有人不服' : '平票 — 这圈不作数',
+        loop: payload.loop,
+        revealWolf: !!payload.wolfChecked,
+        wolfShown: !!payload.wolfChecked,
+      };
+      if (!raf) raf = requestAnimationFrame(draw);
+    } catch (e) { show = null; }
+  }
+
+  function cancel() {
+    show = null;
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+  }
+
+  function setCanvas(c) { canvas = c; }
+
+  return { trigger, cancel, setCanvas, get active() { return !!show; } };
+})();
+</script>
+
+<script>
+// 基础常量
+const TILE = 32, COLS = 30, ROWS = 16;
+const GRAVITY = 0.5, JUMP = -10, MAX_FALL = 15;
+const PW = 24, PH = 24;
+const FLOOR = ROWS - 1;
+const FPS = 60;
+const POWER_DURATION = 10 * FPS;
+const INVULN_DURATION = 60;
+const STOMP_INVULN = 12;
+
+// 道具刷新规则：每类(heal/power)在场数量达到上限后停止刷新该类，
+// 玩家吃掉一个(腾出空位)后才继续刷新该类 —— 避免“全是增伤、没血包”
+const MAX_PER_TYPE = 4;        // 每个类型同屏最多数量（满了就停刷该类）
+const SPAWN_QUOTA = { heal: 3, power: 2 };  // 每圈保底：至少各刷这么多个（AC: 数量提升）
+// 能力道具(时停/剑冲刺/火焰)每圈是否必刷. 原来写死每圈 3 个: 开局 5 秒满图 3 个特殊道具,
+// 竞技性被冲淡; 且它们不受 MAX_PER_TYPE 约束, 数量只跟圈数相关, 跟玩家是否已拥有无关.
+const SPECIAL_SPAWN_ONCE = true;   // true: 玩家已拥有该能力后就不再刷这一类
+// 能力道具落点避开"已刷过"的格子 / 彼此重叠(原来 3 个固定落在世界中部, 可以一次吃 3 个)
+const SPECIAL_X_GAP = 6;
+
+// 怪物冲刺技能配置
+const ENEMY_SKILL = {
+  cd: 30,          // CD秒数
+  duration: 1.2,   // 加速持续(原0.2太短几乎无感)
+  multiplier: 2.5  // 加速倍率
+};
+
+// ===== 手感参数(玩出来的，改之前先自己打两把) =====
+const FEEL = {
+  stompTopTolerance: 6,     // 踩顶判定：玩家底边可低于怪中心多少仍算踩中，容错让下压跟手
+  stompBounce: 0.9,         // 踩顶后回弹 = JUMP * 此值
+  dashSpeed: 600,           // 冲刺水平速度(px/s)
+  dashTime: 0.5,            // 冲刺持续(s)
+  dashCd: 2.5,              // 冲刺冷却(s)
+  hurtKnockback: 4,         // 受击水平击退初速
+  hurtKnockbackT: 12,       // 击退持续帧数
+  dragonStompCd: 0.6,       // 踩龙头冷却(s)，防无限跳连踩秒杀
+  airHops: 2,               // 滞空内还能额外起跳的次数(2=二段跳+踩怪回弹层数) —— 落地后依然随便跳
+  hopVy: JUMP,              // 滞空起跳初速(= 地面跳)
+  hopRefreshT: 0.15,        // 起跳后这么短的时间内再按跳, 不消耗滞空次数(宽松判定"刚离地")
+  skyBandH: 96,             // 头顶软天花板: 脚底高于这一高度就不再给新跳跃动力(防越飞越高)
+  dashHitCd: 0.25,          // 冲刺对同一怪的伤害间隔(s), 单独存, 不再复用 hitFlash
+};
+
+// ===== 白色平台 =====
+// 世界里的实心长方体: 玩家、怪物、箱子、火焰子弹都会被挡住(走同一套 solid() 物理).
+// 不写进 MAP: MAP 是全场景共享的网格, 平台只在世界场景存在, 还要能随时重生成.
+const PLATFORM = {
+  count: 2,             // 每圈生成几个
+  minW: 3, maxW: 6,     // 宽度(格)
+  minTop: 8, maxTop: 11,// 顶边所在行: 8 → 离地面 7 格, 11 → 离地面 4 格(一跳/二段跳都够得着)
+  minDX: 8,             // 离玩家出生点(64px)至少几格, 避免一出生就被挡
+  minGap: 2,            // 平台之间水平至少隔几格
+  color: '#ffffff',     // 白色长方体
+  edge: '#b9c6d6',      // 冷灰描边: 在深蓝背景上看出体积
+};
+let platforms = [];     // [{tx, ty, w, h}] 方格坐标, 生成后只读(平顶: 顶面就是方块顶边)
+
+const COLORS = {
+  wall:'#16213e', floor:'#0f3460', player:'#00d4ff', enemy:'#e94560',
+  bg:'#0a0a1a', text:'#eee',
+  dwall:'#24152f', dfloor:'#3b2048', dbg:'#09030d',
+  itemHeal:'#2ecc71', itemPower:'#f39c12',
+};
+
+let canvas, ctx;
+let state = 'playing', scene = 'world';
+let player, enemies = [], boxes = [], trees = [], items = [];
+let dragon = null;
+let occupied = new Set();
+let camX = 0, camY = 0, lastTime = 0;
+let loopCount = 1, score = 0;
+let timeStopTimer = 0;   // 时停道具: 剩余时停秒数(怪物移速归零,对玩家无效)
+let nearSpD = 0;         // 玩家附近刷新道具的位移累加器
+let fireBullets = [];    // 火焰子弹数组
+let loopEnemiesAtFrameStart = 0;   // 本帧开始时的敌人数量(清圈判定)
+let worldEnemies = [];   // 进副本时把世界里的怪暂存在这里, 出来时原样放回
+let dungeonFightSeen = false;   // 副本里是否真的"打过"怪了(没碰过的副本不计数, 不打就算清圈)
+let hitFx = [];          // 命中特效数组(白色冲击圈)
+const input = { left:false, right:false, jump:false, shoot:false };
+// 音效统一入口: 只转发事件, 不含判定; 失败静默(实现见 audio.js)
+function sfx(name) { if (typeof SFX_HOOK !== 'undefined') SFX_HOOK.play(name); }
+const MUTE_BTN = { x: 0, y: 0, r: 16 };   // 右上角静音按钮, 坐标在 layoutB() 里算
+const MAP = [];
+const DUNGEON_COLS = 40, DUNGEON_ROWS = 20, DUNGEON_MAP = [];
+
+for (let y = 0; y < ROWS; y++) {
+  let r = '';
+  for (let x = 0; x < COLS; x++) r += (y === FLOOR) ? '1' : '0';
+  MAP.push(r);
+}
+for (let y = 0; y < DUNGEON_ROWS; y++) {
+  let r = '';
+  for (let x = 0; x < DUNGEON_COLS; x++)
+    r += (y === DUNGEON_ROWS - 1 || x === 0 || x === DUNGEON_COLS - 1 || y === 0) ? '1' : '0';
+  DUNGEON_MAP.push(r);
+}
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function tk(x, y) { return x + ',' + y; }
+function overlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+// 把世界坐标x平移到玩家当前圈(camX)附近最近的副本, 用于循环地图里实体绘制/拾取对齐
+const WORLD_W = COLS * TILE;
+function wrapToPlayer(x) {
+  const k = Math.round((player.x - x) / WORLD_W);
+  return x + k * WORLD_W;
+}
+// 玩家碰撞混合检测: 冲刺(圆形)用距离检测, 平时(矩形)用AABB
+function playerHits(e) {
+  if (player.dashT > 0) {
+    const px = player.x + player.w / 2, py = player.y + player.h / 2;
+    const ex = e.x + e.w / 2, ey = e.y + e.h / 2;
+    const rr = (e.w + e.h) / 4;
+    return Math.hypot(ex - px, ey - py) < 30 + rr;
+  }
+  return player.overlap(e);
+}
+function tileAt(tx, ty) {
+  if (scene === 'dungeon') {
+    if (ty < 0 || ty >= DUNGEON_ROWS) return '1';
+    return DUNGEON_MAP[ty][((tx % DUNGEON_COLS) + DUNGEON_COLS) % DUNGEON_COLS];
+  }
+  if (ty < 0 || ty >= ROWS) return '1';
+  return MAP[ty][((tx % COLS) + COLS) % COLS];
+}
+// 平台占格查询(只在世界场景生效)
+function platformAt(tx, ty) {
+  if (scene !== 'world') return null;
+  for (const p of platforms) {
+    if (tx >= p.tx && tx < p.tx + p.w && ty >= p.ty && ty < p.ty + p.h) return p;
+  }
+  return null;
+}
+// 统一"实心"入口: 玩家/怪/箱/子弹都只查这里, 平台自动参与碰撞
+function solid(tx, ty) {
+  if (platformAt(tx, ty)) return true;
+  return tileAt(tx, ty) === '1';
+}
+// 实心矩形的实体碰撞框: 平台按整块算(宽 w 格, 厚 h 格), 普通墙就是那一格
+function solidRect(tx, ty) {
+  const p = platformAt(tx, ty);
+  return p ? { x: p.tx * TILE, y: p.ty * TILE, w: p.w * TILE, h: p.h * TILE }
+           : { x: tx * TILE, y: ty * TILE, w: TILE, h: TILE };
+}
+// 某一列(方格)上平台顶边的世界 y, 没有则 Infinity —— 用来把道具放到平台顶上
+function platformSurfaceY(tx) {
+  let best = Infinity;
+  for (const p of platforms) if (tx >= p.tx && tx < p.tx + p.w) best = Math.min(best, p.ty * TILE);
+  return best;
+}
+
+function drawTree(tx, ty, ox, oy) {
+  const px = tx * TILE - ox, py = ty * TILE - oy;
+  ctx.fillStyle = '#6e4628'; ctx.fillRect(px + 10, py - TILE, 12, TILE);
+  ctx.fillStyle = '#3ca03c'; ctx.fillRect(px - 4, py - TILE - 36, 40, 36);
+  ctx.fillStyle = '#2e7d2e'; ctx.fillRect(px - 4, py - TILE - 36, 18, 16);
+}
+
+let secretX = 0, dungeonFound = false, returnX = 64;
+
+function genTrees() {
+  trees = []; occupied.clear(); let a = 0;
+  while (trees.length < 10 && a++ < 600) {
+    const tx = Math.floor(Math.random() * COLS), ty = FLOOR;
+    if (occupied.has(tk(tx, ty))) continue;
+    let ok = true;
+    for (const t of trees) if (Math.abs(t.tx - tx) < 4) { ok = false; break; }
+    if (!ok) continue;
+    occupied.add(tk(tx, ty)); trees.push({ tx, ty });
+  }
+}
+function genBoxes() {
+  boxes = []; let a = 0;
+  while (boxes.length < 5 && a++ < 300) {
+    const tx = Math.floor(Math.random() * COLS), ty = FLOOR - 1;
+    if (occupied.has(tk(tx, ty))) continue;
+    let ok = true;
+    for (const t of trees) if (Math.abs(t.tx - tx) < 3) { ok = false; break; }
+    if (ok && platformAt(tx, ty)) ok = false;   // 别把箱子塞进平台方块里
+    if (!ok) continue;
+    occupied.add(tk(tx, ty)); boxes.push(new Box(tx * TILE + 2, (FLOOR - 1) * TILE + 2));
+  }
+}
+// 生成平台: 每圈在世界里放 PLATFORM.count 个白色长方体
+function genPlatforms() {
+  platforms = [];
+  const spawnTile = Math.round(64 / TILE);   // 玩家出生点所在格
+  let tries = 0;
+  while (platforms.length < PLATFORM.count && tries++ < 400) {
+    const w = PLATFORM.minW + Math.floor(Math.random() * (PLATFORM.maxW - PLATFORM.minW + 1));
+    const tx = 2 + Math.floor(Math.random() * (COLS - 4 - w));
+    const ty = PLATFORM.minTop + Math.floor(Math.random() * (PLATFORM.maxTop - PLATFORM.minTop + 1));
+    const h = 1 + Math.floor(Math.random() * 2);   // 厚度 1~2 格, 看起来是个"长方体"
+    if (ty + h > FLOOR - 2) continue;              // 底下至少留 2 格, 不至于贴地成坎
+    // 离出生点太近 → 跳过
+    if (tx < spawnTile + PLATFORM.minDX && tx + w > spawnTile - PLATFORM.minDX) continue;
+    // 平台之间(世界是循环的, 边界两侧也算挨着)水平至少隔 minGap 格
+    let clash = false;
+    for (const p of platforms) {
+      const left = Math.max(p.tx, tx), right = Math.min(p.tx + p.w, tx + w);
+      if (right + PLATFORM.minGap > left) { clash = true; break; }
+      if (p.tx + p.w >= COLS - PLATFORM.minGap && tx <= PLATFORM.minGap) { clash = true; break; }
+      if (tx + w >= COLS - PLATFORM.minGap && p.tx <= PLATFORM.minGap) { clash = true; break; }
+    }
+    if (clash) continue;
+    platforms.push({ tx, ty, w, h });
+  }
+}
+function genDungeon() { secretX = Math.floor((8 + Math.random() * 192) * TILE); dungeonFound = false; }
+
+function spawnEnemiesForLoop() {
+  enemies = [];
+  const gy = (ROWS - 1) * TILE - 24;
+  const count = Math.min(4 + loopCount + (typeof councilExtraEnemies === 'function' ? councilExtraEnemies() : 0), 12);
+  const pos = [];
+  for (let x = 2; x < COLS - 2; x++) pos.push(x);
+  for (let i = pos.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pos[i], pos[j]] = [pos[j], pos[i]]; }
+  let placed = 0, idx = 0;
+  while (placed < count && idx < pos.length) {
+    const px = pos[idx++] * TILE;
+    if (Math.abs(px - 64) > 160) {
+      const e = new Enemy(px, gy);
+      if (Math.random() < 0.3) { e.baseSpeed *= 1.8; e.baseChase *= 1.5; }   // 约30%怪提速
+      enemies.push(e);
+      placed++;
+    }
+  }
+}
+// 道具落点: 先选格再定高度. 世界里有平台时, 部分道具会放在平台顶上(站地上够不着 → 逼玩家上平台)
+function itemSpot(tx, gy) {
+  // 随机点选时, 如果这一列有平台, 35% 概率放平台顶上(站地上够不到)
+  if (scene === 'world' && platforms.length) {
+    const py = platformSurfaceY(tx);
+    if (py < gy - TILE * 2 && Math.random() < 0.35) return { x: tx * TILE + 6, y: py - 20 - 10 };
+  }
+  return { x: tx * TILE + 6, y: gy - TILE - 10 };
+}
+// 指定一个平台的顶面落点(每圈保证至少有一个道具在平台上)
+function itemSpotOnPlatform(gy) {
+  if (scene !== 'world' || !platforms.length) return null;
+  const p = platforms[Math.floor(Math.random() * platforms.length)];
+  const tx = p.tx + Math.floor(Math.random() * p.w);
+  return { x: tx * TILE + 6, y: p.ty * TILE - 20 - 10 };
+}
+function spawnItems() {
+  items = [];
+  const gy = FLOOR * TILE;
+  const countByType = { heal: 0, power: 0 };
+  const types = ['heal', 'power'];
+  const quota = SPAWN_QUOTA.heal + SPAWN_QUOTA.power;
+  for (let i = 0; i < quota; i++) {
+    const type = types[i % types.length];
+    const tx = 3 + Math.floor(Math.random() * (COLS - 6));
+    const sp = (i === 0 && itemSpotOnPlatform(gy)) || itemSpot(tx, gy);   // 第 1 个道具固定放平台顶上
+    items.push(new Item(sp.x, sp.y, type));
+    countByType[type]++;
+  }
+  const total = 2 + Math.floor(Math.random() * 3);
+  let guard = 0;
+  while (items.length < total && guard++ < 50) {
+    const type = types[Math.floor(Math.random() * types.length)];
+    if (countByType[type] >= MAX_PER_TYPE) continue;
+    const tx = 3 + Math.floor(Math.random() * (COLS - 6));
+    const sp = itemSpot(tx, gy);
+    items.push(new Item(sp.x, sp.y, type));
+    countByType[type]++;
+  }
+  // 能力道具: 时停(可重复)/剑冲刺/火焰. 规则:
+  //  - 已拥有冲刺或火焰时不再刷该道具(否则每圈都白送一个占格子的道具)
+  //  - 落点随机, 并且彼此至少隔 SPECIAL_X_GAP 格(不再三个挤在中部同一处)
+  const specials = [{ type: 'timeStop' }, { type: 'swordDash' }, { type: 'fireSkill' }];
+  const usedX = [];
+  for (const sp of specials) {
+    if (SPECIAL_SPAWN_ONCE && sp.type === 'swordDash' && player && player.hasDash) continue;
+    if (SPECIAL_SPAWN_ONCE && sp.type === 'fireSkill' && player && player.hasFire) continue;
+    // 从普通道具的落点里挑一个不挨着的, 最多试 20 次
+    let tx = 3 + Math.floor(Math.random() * (COLS - 6));
+    for (let k = 0; k < 20 && usedX.some(u => Math.abs(u - tx) < SPECIAL_X_GAP); k++)
+      tx = 3 + Math.floor(Math.random() * (COLS - 6));
+    usedX.push(tx);
+    const pos = itemSpot(tx, gy);
+    items.push(new Item(pos.x, pos.y, sp.type));
+  }
+}
+
+function refillAfterPickup(type) {
+  const gy = (scene === 'dungeon' ? DUNGEON_ROWS - 1 : FLOOR) * TILE;
+  const countByType = { heal: 0, power: 0 };
+  for (const it of items) if (it.type === 'heal' || it.type === 'power') countByType[it.type]++;
+  if (countByType[type] >= MAX_PER_TYPE) return;
+  const tx = 3 + Math.floor(Math.random() * (COLS - 6));
+  const sp = itemSpot(tx, gy);
+  items.push(new Item(sp.x, sp.y, type));
+}
+
+// 玩家附近刷新道具: 玩家走一段后在周围补刷缺的类型(优先回血), 保证走到哪都有道具
+function spawnNearItem() {
+  const gy = (scene === 'dungeon' ? DUNGEON_ROWS - 1 : FLOOR) * TILE;   // 副本地面比世界低, 按当前场景取
+  // 该类型是否已到上限(记录可刷的类型)
+  const countByType = { heal: 0, power: 0 };
+  // 只统计可无限刷的道具, 别让时停/剑/火焰占住 heal/power 的计数位(它们有自己的生成规则)
+  for (const it of items) if (it.type === 'heal' || it.type === 'power') countByType[it.type]++;
+  let type;
+  if (countByType.heal < MAX_PER_TYPE && countByType.power < MAX_PER_TYPE) {
+    type = Math.random() < 0.6 ? 'heal' : 'power';   // 略微偏向回血
+  } else if (countByType.heal < MAX_PER_TYPE) type = 'heal';
+  else if (countByType.power < MAX_PER_TYPE) type = 'power';
+  else return;   // 两类都满了不刷
+
+  // 在玩家附近(左右3~6格)随机落点, 不与玩家重叠
+  const side = Math.random() < 0.5 ? -1 : 1;
+  const away = 3 + Math.floor(Math.random() * 3);   // 离玩家3~5格
+  const tx = Math.round(player.x / TILE) + side * away;
+  const sp = itemSpot(tx, gy);
+  items.push(new Item(sp.x, sp.y, type));
+}
+
+function checkSecret() { if (Math.abs(player.x - secretX) < 20) enterDungeon(); }
+function enterDungeon() {
+  if (scene === 'dungeon') return;
+  dungeonFound = true; returnX = player.x; scene = 'dungeon';
+  sfx('door');
+  player.x = 3 * TILE; player.y = (DUNGEON_ROWS - 1) * TILE - player.h;
+  player.vx = 0; player.vy = 0; player.onGround = true;
+  // 世界里的怪先存起来, 出来时放回(不能直接丢掉, 否则世界变空、清圈判定也跟着乱)
+  worldEnemies = enemies;
+  dungeonFightSeen = false;
+  enemies = [];
+  const gy = (DUNGEON_ROWS - 1) * TILE - 24;
+  for (let i = 0; i < 8; i++) enemies.push(new Enemy((5 + Math.random() * 30) * TILE, gy));
+}
+// 出口在副本最左边的 TILE*2 以内. 原来只要 player.vx<0 就算数,
+// 但受击击退会写 knockVx=-4, 人还没走到门口就被"倒着推"回世界了 → 改成真的往左走在门口
+function checkExit() {
+  if (player.x < TILE * 2 && input.left) leaveDungeon();   // 必须玩家自己往左走, 被击退撞到门口不算
+}
+function leaveDungeon() {
+  // 真把副本里的怪清干净了, 才发一次和清圈同样的奖励(战斗点才算数, 撞门进来不打就走不算)
+  const cleared = dungeonFightSeen && enemies.length === 0;
+  scene = 'world';
+  player.x = returnX + 80; player.y = (ROWS - 1) * TILE - player.h;
+  player.vx = 0; player.vy = 0; player.onGround = true;
+  enemies = [];              // 没打完的副本怪不跟着回世界(它们的坐标是副本地面, 回世界会掉进土里)
+  for (const e of worldEnemies) { if (e.hp > 0) enemies.push(e); }   // 世界原有的怪原样放回
+  worldEnemies = [];
+  dungeonFightSeen = false;
+  // 本帧开始时的敌人数对齐, 免得回来那一帧被当成"刚把怪打光"
+  loopEnemiesAtFrameStart = enemies.length;
+  if (cleared) {
+    score += 300;
+    sfx('loopclear');
+    if (typeof COUNCIL !== 'undefined') { COUNCIL.showT = 0; }
+    hitFx.push({ x: player.x + player.w / 2, y: player.y - 10, t: 0, dur: 0.5, r: 24, text: '副本清空 +300' });
+  }
+}
+
+// 怪与怪、怪与玩家 的碰撞响应: 位置修正 + 踩顶重置
+// 玩家踩怪顶 → 置顶并重置垂直速度; 否则按穿透深度推离表面
+function resolveEnemyCollisions() {
+  // ---- 玩家对怪: 只做水平推开(防侧面穿模) ----
+  // 垂直方向的踩顶/回弹完全交给 loop 里的 checkStomp 负责, 这里不碰 vy 和垂直位置,
+  // 否则会提前把玩家顶平、破坏 checkStomp 的"从上落下"判定 → 不掉血也不回弹
+  for (const e of enemies) {
+    if (e.hp <= 0) continue;
+    const ox = Math.min(player.x + player.w, e.x + e.w) - Math.max(player.x, e.x);
+    const oy = Math.min(player.y + player.h, e.y + e.h) - Math.max(player.y, e.y);
+    if (ox <= 0 || oy <= 0) continue;
+    // 只做水平推开(同样避免垂直处理干扰踩踏判定)
+    if (ox < oy) {
+      if (player.x < e.x) player.x = e.x - player.w;
+      else player.x = e.x + e.w;
+    }
+  }
+
+  // ---- 怪对怪: 互不重叠(半推开) ----
+  for (let it = 0; it < 3; it++) {
+    let moved = false;
+    for (let i = 0; i < enemies.length; i++) {
+      for (let j = i + 1; j < enemies.length; j++) {
+        const A = enemies[i], B = enemies[j];
+        if (!A || !B) continue;
+        if (A.hp <= 0 || B.hp <= 0) continue;
+        const ox = Math.min(A.x + A.w, B.x + B.w) - Math.max(A.x, B.x);
+        const oy = Math.min(A.y + A.h, B.y + B.h) - Math.max(A.y, B.y);
+        if (ox <= 0 || oy <= 0) continue;
+        if (ox < oy) { const p = ox / 2; A.x -= p; B.x += p; }
+        else { const p = oy / 2; A.y -= p; B.y += p; }
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+}
+
+function checkStomp(tg) {
+  // 稳定纯空间判定: 玩家底部位于怪的"上半区"即视为踩顶(压怪)
+  // 不比 vy、不赌穿透帧, 只看玩家此刻相对怪体的位置, 不去随机
+  // FEEL.stompTopTolerance 是手感容错, 玩出来的, 别乱改
+  const playerBottom = player.y + player.h;
+  const midY = tg.y + tg.h / 2;             // 怪体中心y
+  const horizOverlap =
+    player.x + player.w > tg.x + 2 && player.x < tg.x + tg.w - 2;
+  return horizOverlap && playerBottom <= midY + FEEL.stompTopTolerance;
+}
+
+// ===== 火焰远程射击(碰道具 fireSkill 获得, 按 E/发射键开火) =====
+// 统一入口: 按键只设 input.shoot, 唯一在 updateFire 里触发, 避免触屏+键盘双触发
+function fireShoot() {
+  if (!player.alive || !player.hasFire) return;
+  if (player.fireCd > 0) return;
+  player.fireCd = 30;   // 30帧冷却(=0.5s)
+  const dir = player.facing;   // 按最近朝向发射, 断触不弹回右
+  const bx = player.x + (dir > 0 ? player.w : 0);
+  const by = player.y + player.h / 2 - 4;
+  fireBullets.push({ x: bx, y: by, dir, life: 600 });   // 600px射程
+  sfx('shoot');
+}
+function updateFire(dt) {
+  if (player.fireCd > 0) player.fireCd -= 1;   // 按帧
+  if (input.shoot && player.hasFire) { fireShoot(); input.shoot = false; }   // 唯一触发点
+  for (let i = fireBullets.length - 1; i >= 0; i--) {
+    const b = fireBullets[i];
+    b.x += b.dir * 10;
+    b.life -= 10;
+    // 撞墙
+    const tx = Math.floor(b.x / TILE), ty = Math.floor(b.y / TILE);
+    if (solid(tx, ty)) { fireBullets.splice(i, 1); continue; }
+    // 射程耗尽
+    if (b.life <= 0) { fireBullets.splice(i, 1); continue; }
+    // 撞怪
+    let hit = false;
+    for (let j = 0; j < enemies.length; j++) {
+      const e = enemies[j];
+      if (e.hp <= 0) continue;
+      if (Math.abs(b.x - (e.x + e.w / 2)) < e.w && Math.abs(b.y - (e.y + e.h / 2)) < e.h) {
+        damageEnemy(e);   // 固定每发1伤(普通怪2血→两枪一死)
+        hit = true; break;
+      }
+    }
+    if (hit) fireBullets.splice(i, 1);
+  }
+}
+function drawFire(ox, oy) {
+  for (const b of fireBullets) {
+    ctx.fillStyle = '#ff8833';
+    ctx.beginPath(); ctx.arc(b.x - ox, b.y - oy, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#ffcc66';
+    ctx.beginPath(); ctx.arc(b.x - ox - b.dir * 2, b.y - oy, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+// 连踩倍率: 3 连踩起 ×1.5, 5 连踩起 ×2.0, 落地清零
+function comboMul() {
+  const c = (player && player.airCombo) || 0;
+  if (c >= 5) return 2.0;
+  if (c >= 3) return 1.5;
+  return 1;
+}
+
+// 冲刺伤害写入独立的 dashHitCd, 受击白闪走 hitFlash.
+// 原来的调用方自己写 e.hitFlash = 0.25 来限频, 把白闪当成 CD 用:
+// 没有命中特效, 且会盖住"真的被打到"的 0.15s 白闪.
+function damageEnemy(e, viaStomp) {
+  // 命中反馈: 在怪物中心挂一个 0.22s 的扩散白圈(冲刺/火焰/踩踏通用)
+  hitFx.push({ x: e.x + e.w / 2, y: e.y + e.h / 2, t: 0, dur: 0.22, r: Math.max(e.w, e.h) * 0.75 });
+  if (player.powerTimer > 0) e.hp = 0;
+  else e.hp--;
+  e.hitFlash = 0.15;
+  sfx(viaStomp ? 'stomp' : 'hit');
+  // 只有踩踏命中才累计连踩(冲刺/火焰不加)
+  if (viaStomp) {
+    player.airCombo++;
+    if (player.airCombo > player.bestCombo) player.bestCombo = player.airCombo;
+  }
+  if (e.hp <= 0) {
+    sfx('kill');
+    const i = enemies.indexOf(e);
+    if (i > -1) enemies.splice(i, 1);
+    score += Math.round(100 * loopCount * comboMul());
+    if (typeof loopStats !== 'undefined') loopStats.kills++;   // 圆桌态度样本
+  }
+}
+
+// 命中特效: 扩散圆环, 透明度随进度衰减
+function updateHitFx(dt) {
+  for (let i = hitFx.length - 1; i >= 0; i--) {
+    hitFx[i].t += dt;
+    if (hitFx[i].t >= hitFx[i].dur) hitFx.splice(i, 1);
+  }
+}
+function drawHitFx(ox, oy) {
+  for (const f of hitFx) {
+    const p = f.t / f.dur;                       // 0 → 1
+    const r = f.r + 26 * p;                      // 向外扩散
+    ctx.strokeStyle = 'rgba(255,255,255,' + (0.85 * (1 - p)).toFixed(3) + ')';
+    ctx.lineWidth = 3 * (1 - p) + 0.5;
+    ctx.beginPath(); ctx.arc(f.x - ox, f.y - oy, r, 0, Math.PI * 2); ctx.stroke();
+    if (f.text) {
+      ctx.fillStyle = 'rgba(255,255,255,' + (1 - p).toFixed(3) + ')';
+      ctx.font = 'bold 16px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(f.text, f.x - ox, f.y - oy - 16 - 20 * p);
+      ctx.textAlign = 'left';
+    }
+  }
+  ctx.lineWidth = 1;   // 复位, 别影响后面 Box 的描边
+}
+
+function checkLoopComplete() {
+  if (scene !== 'world') return;
+  if (enemies.length === 0) { sfx('loopclear'); onLoopComplete(); }
+}
+function onLoopComplete() {
+  // 裁定用的是"刚打完这一圈"的战绩, 所以必须先结算, 再把战绩清零
+  // (原来的顺序是 刷怪 -> councilResetStats, 只是"刚好"没错; 但圈号已经 +1 才记录, 日志错圈)
+  const finishedLoop = loopCount;
+  // 圆桌裁定: 用"刚打完这一圈"的表现投票决定下一圈是赏还是罚
+  const verdict = councilRound(finishedLoop);
+  loopCount++;
+  player.hp = Math.min(player.maxHp, player.hp + 1);
+  if (verdict === 'reward') player.hp = Math.min(player.maxHp, player.hp + 1);   // 赏: 额外回 1 血
+  player.x = 64; player.y = (ROWS - 1) * TILE - player.h;
+  player.vx = 0; player.vy = 0; player.onGround = true;
+  spawnEnemiesForLoop();   // 这里会消耗上一轮 councilRound 写下的 extraEnemies
+  spawnItems();
+  councilResetStats();   // 新一圈重新采样
+  if (loopCount % 3 === 0 && (!dragon || !dragon.alive)) {
+    dragon = new Dragon();
+    dragon.spawn(500, (ROWS - 1) * TILE - 180);
+  }
+}
+function onPlayerDeath() { sfx('death'); if (typeof COUNCIL_UI !== 'undefined') COUNCIL_UI.cancel(); state = 'gameover'; clearInput(); }
+
+// 清空所有输入状态: 死亡时按住的键会在重开后继续生效(一复活就自己往左跑)
+function clearInput() {
+  input.left = false; input.right = false; input.jump = false; input.shoot = false;
+  for (const k in BTN) BTN[k].pressed = false;
+  tm.clear();
+}
+
+const CAM_TOP_PAD = 4 * TILE;
+function camTarget() {
+  if (scene === 'dungeon') {
+    return {
+      x: clamp(player.x + player.w / 2 - canvas.width / 2, 0, DUNGEON_COLS * TILE - canvas.width),
+      y: clamp(player.y + player.h / 2 - canvas.height / 2, 0, DUNGEON_ROWS * TILE - canvas.height),
+    };
+  }
+  // 顶边留 4 格余量: 有平台后玩家会比原来高, 站在平台上时相机可以往上多看一点; 站地面时仍是 0
+  return {
+    x: player.x + player.w / 2 - canvas.width / 2,
+    y: clamp(player.y + player.h / 2 - canvas.height / 2, -CAM_TOP_PAD, ROWS * TILE - canvas.height),
+  };
+}
+
+function drawWorldMap(ox, oy) {
+  ctx.fillStyle = COLORS.floor;
+  ctx.fillRect(0, 0, canvas.width, (ROWS-1) * TILE - oy);
+  ctx.fillStyle = COLORS.wall;
+  ctx.fillRect(0, (ROWS-1) * TILE - oy, canvas.width, TILE);
+}
+
+// 龙的巡航区间可视化: 地面一条极淡光带 + 两端边界微光
+// 纯渲染, 不改任何判定; 想更明显就调 bandAlpha / edgeAlpha
+const PATROL_VIZ = { bandAlpha: 0.10, edgeAlpha: 0.20, bandH: 14, edgeH: 26 };
+function drawPatrolZone(ox, oy) {
+  if (scene !== 'world' || !dragon || !dragon.alive) return;
+  const zl = dragon.patrolX - dragon.patrolHalf - ox;
+  const zr = dragon.patrolX + dragon.patrolHalf - ox;
+  const w = zr - zl;
+  if (w <= 0) return;
+  const fy = (ROWS - 1) * TILE - oy;      // 地面顶边
+  // 光带: 两端淡出, 中间最亮(也很淡)
+  const g = ctx.createLinearGradient(zl, 0, zr, 0);
+  g.addColorStop(0, 'rgba(233,69,96,0)');
+  g.addColorStop(0.5, 'rgba(233,69,96,' + PATROL_VIZ.bandAlpha + ')');
+  g.addColorStop(1, 'rgba(233,69,96,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(zl, fy - PATROL_VIZ.bandH, w, PATROL_VIZ.bandH);
+  // 两端边界: 呼吸式短竖线, 提示"拉到这里它就掉头"
+  const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 400);
+  const a = (PATROL_VIZ.edgeAlpha * (0.6 + 0.7 * pulse)).toFixed(3);
+  ctx.fillStyle = 'rgba(233,69,96,' + a + ')';
+  ctx.fillRect(zl - 1, fy - PATROL_VIZ.edgeH, 2, PATROL_VIZ.edgeH);
+  ctx.fillRect(zr - 1, fy - PATROL_VIZ.edgeH, 2, PATROL_VIZ.edgeH);
+}
+
+function drawDungeonMap(ox, oy) {
+  const sc = Math.floor(ox / TILE); const ec = sc + Math.ceil(canvas.width / TILE) + 1;
+  const sr = Math.floor(oy / TILE); const er = sr + Math.ceil(canvas.height / TILE) + 1;
+  for (let y = sr; y <= er && y < DUNGEON_ROWS; y++) {
+    if (y < 0) continue;
+    for (let x = sc; x <= ec && x < DUNGEON_COLS; x++) {
+      if (x < 0) continue;
+      ctx.fillStyle = DUNGEON_MAP[y][x] === '1' ? COLORS.dwall : COLORS.dfloor;
+      ctx.fillRect(x * TILE - ox, y * TILE - oy, TILE, TILE);
+    }
+  }
+  ctx.fillStyle = '#00d4ff';
+  ctx.fillRect(TILE * 1.2 - ox, (DUNGEON_ROWS - 2) * TILE - oy, 20, 32);
+}
+// 白色长方体: 白色面 + 顶部高光 + 底部暗边 + 冷灰描边, 看得出厚度
+function drawPlatforms(ox, oy) {
+  if (scene !== 'world') return;
+  const sc = Math.floor(ox / TILE) - 1, ec = sc + Math.ceil(canvas.width / TILE) + 2;
+  for (const p of platforms) {
+    for (let off = -10; off <= 10; off++) {   // 循环地图: 两侧副本一起画
+      const rx = p.tx + off * COLS;
+      if (rx + p.w < sc || rx > ec) continue;
+      const x = rx * TILE - ox, y = p.ty * TILE - oy, w = p.w * TILE, h = p.h * TILE;
+      ctx.fillStyle = PLATFORM.color;
+      ctx.fillRect(x, y, w, h);
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(x, y, w, 3);            // 顶面高光
+      ctx.fillStyle = 'rgba(110,130,160,0.30)'; ctx.fillRect(x, y + h - 3, w, 3);  // 底面阴影
+      ctx.strokeStyle = PLATFORM.edge; ctx.lineWidth = 2;
+      ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+      ctx.lineWidth = 1;   // 立刻还原: 别让 2px 描边带到后面的箱子/文字上
+    }
+  }
+}
+function drawTreesOnMap(ox, oy) {
+  if (scene !== 'world') return;
+  const sc = Math.floor(ox / TILE) - 2; const ec = sc + Math.ceil(canvas.width / TILE) + 3;
+  for (const t of trees) {
+    for (let off = -10; off <= 10; off++) {
+      const rt = t.tx + off * COLS;
+      if (rt < sc || rt > ec) continue;
+      drawTree(rt, t.ty, ox, oy);
+    }
+  }
+}
+function drawHUD() {
+  ctx.fillStyle = COLORS.text; ctx.font = '16px Courier New';
+  ctx.fillText('HP:', 12, 24);
+  for (let i = 0; i < player.maxHp; i++) {
+    ctx.fillStyle = i < player.hp ? '#e94560' : '#333';
+    ctx.fillRect(44 + i * 18, 12, 14, 16);
+  }
+  ctx.fillStyle = scene === 'dungeon' ? '#ff88ff' : COLORS.text;
+  ctx.fillText(scene === 'dungeon' ? 'DUNGEON' : 'WORLD', 12, 48);
+  ctx.fillStyle = COLORS.text;
+  ctx.fillText('LOOP: ' + loopCount, 12, 70);
+  ctx.fillText('SCORE: ' + score, 12, 92);
+  // 连踩提示: 2 连起显示, 到 3/5 连时标出倍率
+  if (player.airCombo >= 2) {
+    const m = comboMul();
+    ctx.fillStyle = m > 1 ? '#ffd24a' : '#00d4ff';
+    ctx.fillText('COMBO x' + player.airCombo + (m > 1 ? '  ×' + m.toFixed(1) : ''), 12, 136);
+  }
+  if (player.powerTimer > 0) {
+    ctx.fillStyle = COLORS.itemPower;
+    ctx.fillText('POWER! ' + Math.ceil(player.powerTimer / FPS) + 's', 12, 114);
+  }
+  // 圆桌裁定结论: 圈末显示 4 秒
+  if (typeof COUNCIL !== 'undefined' && COUNCIL.last && COUNCIL.showT > 0) {
+    ctx.fillStyle = COUNCIL.last.kind === 'reward' ? '#2ecc71'
+      : COUNCIL.last.kind === 'penalty' ? '#e94560' : '#aaa';
+    ctx.fillText(COUNCIL.last.text, 12, 158);
+  }
+
+  if (dragon && dragon.alive) {
+    const bw = 200, x = canvas.width / 2 - bw / 2, y = 12;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(x - 4, y - 4, bw + 8, 28);
+    ctx.fillStyle = '#440'; ctx.fillRect(x, y, bw, 20);
+    const r = Math.max(0, dragon.hp / dragon.maxHp);
+    const g = ctx.createLinearGradient(x, 0, x + bw, 0);
+    g.addColorStop(0, '#f22'); g.addColorStop(0.5, '#f80'); g.addColorStop(1, '#ff0');
+    ctx.fillStyle = g; ctx.fillRect(x, y, bw * r, 20);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 12px Courier New'; ctx.textAlign = 'center';
+    ctx.fillText('DRAGON HP:' + Math.ceil(dragon.hp), canvas.width / 2, y + 14);
+    ctx.textAlign = 'left';
+  }
+}
+
+function drawMinimap() {
+  if (scene === 'dungeon') {
+    const TP = 6, mw = DUNGEON_COLS * TP, mh = DUNGEON_ROWS * TP;
+    const mx = canvas.width - mw - 12, my = 12;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(mx, my, mw, mh);
+    for (let y = 0; y < DUNGEON_ROWS; y++)
+      for (let x = 0; x < DUNGEON_COLS; x++) {
+        ctx.fillStyle = DUNGEON_MAP[y][x] === '1' ? '#24152f' : '#3b2048';
+        ctx.fillRect(mx + x * TP, my + y * TP, TP, TP);
+      }
+    ctx.fillStyle = COLORS.enemy;
+    for (const e of enemies) ctx.fillRect(mx + Math.floor(e.x / TILE) * TP, my + Math.floor(e.y / TILE) * TP, 3, 3);
+    ctx.fillStyle = COLORS.player;
+    ctx.fillRect(mx + Math.floor(player.x / TILE) * TP, my + Math.floor(player.y / TILE) * TP, 5, 5);
+    return;
+  }
+  const MW = 140, MH = 80, MX = canvas.width - MW - 12, MY = 12, WW = COLS * TILE;
+  const px = player.x + player.w / 2, py = player.y + player.h / 2;
+  const np = ((px % WW) + WW) % WW;
+  const sx = MW / WW, sy = MH / (ROWS * TILE);
+  ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(MX, MY, MW, MH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.strokeRect(MX, MY, MW, MH);
+  ctx.fillStyle = 'rgba(255,255,255,0.7)'; ctx.font = '10px Courier New';
+  ctx.fillText('MAP', MX + 4, MY + 12);
+  const tmp = (ox, oy) => {
+    const n = ((ox % WW) + WW) % WW;
+    let dx = n - np;
+    if (dx > WW / 2) dx -= WW;
+    if (dx < -WW / 2) dx += WW;
+    // 把位置钳制在小地图框内,避免玩家飞到地图外(如无限跳冲出屏幕顶)时,
+    // 树/怪/箱等相对玩家y偏移巨大而全部弹出小地图框架外
+    const px2 = clamp(MX + MW / 2 + dx * sx, MX, MX + MW);
+    const py2 = clamp(MY + MH / 2 + (oy - py) * sy, MY, MY + MH);
+    return { x: px2, y: py2 };
+  };
+  ctx.fillStyle = COLORS.wall; ctx.fillRect(MX, MY + MH - 4, MW, 4);
+  ctx.fillStyle = '#3ca03c';
+  for (const t of trees) { const p = tmp(t.tx * TILE + TILE / 2, t.ty * TILE + TILE / 2); ctx.fillRect(p.x - 2, p.y - 2, 4, 4); }
+  ctx.fillStyle = '#8B5E3C';
+  for (const b of boxes) { const p = tmp(b.x + b.w / 2, b.y + b.h / 2); ctx.fillRect(p.x - 3, p.y - 3, 6, 6); }
+  ctx.fillStyle = '#fff';
+  for (const pf of platforms) ctx.fillRect(MX + pf.tx * sx, MY + pf.ty * sy, Math.max(2, pf.w * sx), Math.max(1, pf.h * sy));
+  for (const it of items) { const p = tmp(it.x + it.w / 2, it.y + it.h / 2); ctx.fillStyle = it.type === 'heal' ? COLORS.itemHeal : it.type === 'timeStop' ? '#aa40ff' : it.type === 'swordDash' ? '#4fd8ff' : it.type === 'fireSkill' ? '#ff6622' : COLORS.itemPower; ctx.fillRect(p.x - 2, p.y - 2, 4, 4); }
+  ctx.fillStyle = COLORS.enemy;
+  for (const e of enemies) { const p = tmp(e.x + e.w / 2, e.y + e.h / 2); ctx.fillRect(p.x - 2, p.y - 2, 5, 5); }
+  if (dragon && dragon.alive) { ctx.fillStyle = '#fff'; const p = tmp(dragon.x, dragon.y); ctx.fillRect(p.x - 4, p.y - 4, 8, 8); }
+  ctx.fillStyle = COLORS.player; ctx.fillRect(MX + MW / 2 - 4, MY + MH / 2 - 4, 8, 8);
+}
+
+function startGame() {
+  state = 'playing'; scene = 'world'; loopCount = 1; score = 0;
+  clearInput();   // 先清输入: 否则死亡瞬间按着的方向键会带进新局
+  enemies = []; items = []; boxes = []; trees = []; dragon = null; occupied = new Set();
+  timeStopTimer = 0; nearSpD = 0; hitFx.length = 0; fireBullets.length = 0;
+  if (typeof councilReset === 'function') councilReset();   // 圆桌: 新局重置
+  if (typeof COUNCIL_UI !== 'undefined') COUNCIL_UI.cancel();   // 圆桌动画: 新局从头来
+  genPlatforms(); genTrees(); genBoxes(); genDungeon();
+  player = new Player(64, (ROWS - 1) * TILE - PH);
+  spawnEnemiesForLoop();
+  spawnItems();
+  lastTime = performance.now();
+}
+
+const BTN = {
+  left: { x: 0, y: 0, r: 32, hitR: 48, pressed: false, key: 'left' },
+  right: { x: 0, y: 0, r: 32, hitR: 48, pressed: false, key: 'right' },
+  fire: { x: 0, y: 0, r: 30, hitR: 46, pressed: false, key: 'fire' },
+  dash: { x: 0, y: 0, r: 36, hitR: 52, pressed: false, key: 'dash' },
+  jump: { x: 0, y: 0, r: 40, hitR: 56, pressed: false, key: 'jump' },
+};
+const tm = new Map();
+// 优先级(从高到低): 位置最独立的能力键在前, 方向键在后.
+// 原来的顺序里 jump 排在 dash 前面, 而两键只差 80px、hitR 分别是 56/52 ——
+// dash 视觉圆右侧约 6% 的点会被判成 jump, 方向键的命中区也被相邻按钮削掉一截.
+const BTN_ORDER = ['dash', 'fire', 'jump', 'left', 'right'];
+// 只允许"视觉圆 + 少量容错"作为命中区, 避免看不到的区域误触
+function hitRadius(b) { return b.r + 8; }
+/* old layout (保留注释做对照):
+  BTN.left  = (p+32,  H-p-32)   BTN.right = (p+100, H-p-32)
+  BTN.jump  = (W-p-40, H-p-40)  BTN.dash  = (W-p-120, H-p-40)
+  BTN.fire  = (W-p-150, H-p-92)
+*/
+function layoutB() {
+  const p = 24;
+  // 方向键: 间距 90px (原来 68px, 两个 48px 的命中区各被削掉 10px)
+  BTN.left.x = p + 34; BTN.left.y = canvas.height - p - 34;
+  BTN.right.x = p + 124; BTN.right.y = canvas.height - p - 34;
+  // 右手区: 冲刺与跳跃拉开到 140px, 火焰放左上一点, 三者互不重叠(圆内全部命中自己)
+  BTN.jump.x = canvas.width - p - 44; BTN.jump.y = canvas.height - p - 44;
+  BTN.dash.x = canvas.width - p - 184; BTN.dash.y = canvas.height - p - 44;
+  BTN.fire.x = canvas.width - p - 114; BTN.fire.y = canvas.height - p - 156;
+  // 静音按钮: 右上角(小, 不抢操作); 触屏和键盘 M 都能切
+  MUTE_BTN.x = canvas.width - 30; MUTE_BTN.y = 30; MUTE_BTN.r = 16;
+}
+function btnAt(x, y) {
+  for (const key of BTN_ORDER) {
+    if (key === 'dash' && !(player && player.hasDash)) continue;   // 获得冲刺才显示
+    if (key === 'fire' && !(player && player.hasFire)) continue;   // 获得火焰才显示
+    const b = BTN[key];
+    const dx = x - b.x, dy = y - b.y;
+    const r = hitRadius(b);
+    if (dx * dx + dy * dy <= r * r) return b;
+  }
+  return null;
+}
+function pb(b) {
+  if (!b || b.pressed) return;
+  b.pressed = true;
+  if (b.key === 'jump') { if (player && player.alive) player.jump(); }
+  else if (b.key === 'dash') { if (player && player.alive) player.dash(); }
+  else if (b.key === 'fire') { input.shoot = true; }   // 统一走 input.shoot, 由 updateFire 触发
+  else input[b.key] = true;   // left/right 持续按住
+}
+function rb(b) { if (!b || !b.pressed) return; b.pressed = false; input[b.key] = false; }
+function ts(e) {
+  e.preventDefault();
+  if (state === 'gameover') { startGame(); return; }
+  for (const t of e.changedTouches) { const b = btnAt(t.clientX, t.clientY); if (b) { tm.set(t.identifier, b); pb(b); } }
+}
+function tm2(e) {
+  e.preventDefault();
+  for (const t of e.changedTouches) { const ob = tm.get(t.identifier), nb = btnAt(t.clientX, t.clientY); if (ob !== nb) { rb(ob); if (nb) { tm.set(t.identifier, nb); pb(nb); } else tm.delete(t.identifier); } }
+}
+function te(e) { e.preventDefault(); for (const t of e.changedTouches) { rb(tm.get(t.identifier)); tm.delete(t.identifier); } }
+function drawB() {
+  const btns = [BTN.left, BTN.right, BTN.jump];
+  if (player && player.hasDash) btns.push(BTN.dash);   // 获得冲刺才显示
+  if (player && player.hasFire) btns.push(BTN.fire);   // 获得火焰才显示
+  for (const b of btns) {
+    ctx.globalAlpha = b.pressed ? 0.6 : 0.3; ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1; ctx.fillStyle = b.pressed ? '#00d4ff' : '#aaa';
+    ctx.font = b === BTN.jump ? 'bold 16px sans-serif' : b === BTN.dash ? 'bold 14px sans-serif' : b === BTN.fire ? 'bold 15px sans-serif' : 'bold 22px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(b === BTN.jump ? 'JUMP' : b === BTN.dash ? '⚔️' : b === BTN.fire ? '🔥' : (b === BTN.left ? '◀' : '▶'), b.x, b.y);
+  }
+  ctx.textAlign = 'left';
+  // 静音按钮(右上角): 喇叭 / 静音
+  const muted = (typeof AUDIO !== 'undefined') && AUDIO.muted;
+  ctx.globalAlpha = 0.55;
+  ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(MUTE_BTN.x, MUTE_BTN.y, MUTE_BTN.r, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = muted ? '#666' : '#00d4ff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(MUTE_BTN.x, MUTE_BTN.y, MUTE_BTN.r, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = muted ? '#666' : '#00d4ff';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 16px sans-serif';
+  ctx.fillText(muted ? '🔇' : '🔊', MUTE_BTN.x, MUTE_BTN.y + 1);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+}
+
+// ===== 圆桌裁定: 把狼人杀的三态态度 / 传播 / 加权投票搬进肉鸽 =====
+// 每圈结束触发一次。只读本圈战绩, 不改任何战斗判定。
+// 三态: 1=同意(支持你)  -1=反对(要给你上强度)  0=没想法
+const COUNCIL = {
+  members: 5,            // 村民数(不含隐狼)
+  wolfChecked: false,    // 隐狼是否"被验"(本圈拿到火焰 → 火光照出来)
+  att: {},               // 每个村民的态度
+  votes: {},             // 本轮票型
+  last: null,            // 上一轮结论 {text, kind, detail}
+  showT: 0,              // HUD 显示剩余秒数
+  log: [],
+  extraEnemies: 0,       // 惩罚: 下一圈额外刷几只
+};
+
+// 本圈战绩: hurt() 里 +1, 击杀时 +1
+const loopStats = { hits: 0, kills: 0, fire: 0 };
+
+function councilReset() {
+  COUNCIL.wolfChecked = false;
+  COUNCIL.att = {}; COUNCIL.votes = {}; COUNCIL.last = null;
+  COUNCIL.showT = 0; COUNCIL.log = []; COUNCIL.extraEnemies = 0;
+  loopStats.hits = 0; loopStats.kills = 0; loopStats.fire = 0;
+}
+
+// --- 三态评估: 基础概率 + 战绩修正 + 隐狼状态机 ---
+function councilEvaluate() {
+  // 战绩影响: 挨打越多越招人烦, 杀怪越多越有威信(都做温和修正)
+  const hurtPenalty = Math.min(0.25, loopStats.hits * 0.06);
+  const killBonus = Math.min(0.20, loopStats.kills * 0.02);
+
+  for (let i = 0; i < COUNCIL.members; i++) {
+    const name = '村民' + (i + 1);
+    let pAgree = 0.4 + killBonus - hurtPenalty;
+    let pDisagree = 0.3 + hurtPenalty * 0.5;
+
+    // 隐狼: 混在村民里(固定第 3 位), 平时完美伪装, 被验后爆发带节奏
+    if (i === 2) {
+      if (COUNCIL.wolfChecked) { pAgree = 0.1; pDisagree = 0.7; }
+      else { pAgree = 0.4; pDisagree = 0.3; }
+    }
+
+    const r = Math.random();
+    if (r < pAgree) COUNCIL.att[name] = 1;
+    else if (r < pAgree + pDisagree) COUNCIL.att[name] = -1;
+    else COUNCIL.att[name] = 0;
+  }
+}
+
+// --- 传播: 没想法的人跟随多数 ---
+function councilPropagate() {
+  let agree = 0, disagree = 0;
+  for (const k in COUNCIL.att) {
+    if (COUNCIL.att[k] === 1) agree++;
+    else if (COUNCIL.att[k] === -1) disagree++;
+  }
+  for (const k in COUNCIL.att) {
+    if (COUNCIL.att[k] !== 0) continue;
+    if (agree > disagree) COUNCIL.att[k] = 1;
+    else if (disagree > agree) COUNCIL.att[k] = -1;
+  }
+}
+
+// --- 加权投票: 同意给"奖励"加分, 反对给"上强度"加分 ---
+function councilVote() {
+  const v = { reward: 0, penalty: 0 };
+  for (const k in COUNCIL.att) {
+    if (COUNCIL.att[k] === 1) v.reward += 5;
+    else if (COUNCIL.att[k] === -1) { v.penalty += 4; v.reward += 1; }
+    else v[Math.random() < 0.5 ? 'reward' : 'penalty'] += 1;
+  }
+  return v;
+}
+
+// --- 一圈结束调一次: 出结论, 返回给流程层去执行 ---
+function councilRound(finishedLoop) {
+  COUNCIL.wolfChecked = loopStats.fire > 0;   // 本圈拿到火焰 = 火光照出隐狼
+  councilEvaluate();
+  councilPropagate();
+  const v = councilVote();
+  COUNCIL.votes = v;
+
+  let kind, text;
+  if (v.reward > v.penalty) {
+    kind = 'reward';
+    text = '圆桌：放行 — 村民支持你（' + v.reward + ' : ' + v.penalty + '）';
+  } else if (v.penalty > v.reward) {
+    kind = 'penalty';
+    COUNCIL.extraEnemies = 1;
+    text = '圆桌：加码 — 有人不服（' + v.reward + ' : ' + v.penalty + '）';
+  } else {
+    kind = 'none';
+    text = '圆桌：平票 — 这圈不作数（' + v.reward + ' : ' + v.penalty + '）';
+  }
+  COUNCIL.last = { kind, text };
+  COUNCIL.showT = 4;
+  const _loopNo = (finishedLoop === undefined ? loopCount : finishedLoop);
+  COUNCIL.log.push({ loop: _loopNo, kind, v });
+  // 圆桌头像动画: 只读上面的结果, 不改任何数据, 也不消耗随机数
+  if (typeof COUNCIL_UI !== 'undefined') {
+    COUNCIL_UI.trigger({ att: COUNCIL.att, votes: v, kind, members: COUNCIL.members, loop: _loopNo, wolfChecked: COUNCIL.wolfChecked });
+  }
+  if (typeof sfx === 'function') sfx(kind === 'reward' ? 'councilYes' : kind === 'penalty' ? 'councilNo' : 'councilEven');
+  return kind;
+}
+
+// HUD 提示: 结论后显示 4 秒
+function councilUpdate(dt) {
+  if (COUNCIL.showT > 0) COUNCIL.showT -= dt;
+}
+
+// 新一圈重新采样战绩
+function councilResetStats() { loopStats.hits = 0; loopStats.kills = 0; loopStats.fire = 0; }
+
+// 刷怪前读取惩罚(只生效一次).
+// 注意: 只有"下一圈"的第一次刷怪能吃到; councilRound 在 onLoopComplete 里
+// 先于 spawnEnemiesForLoop 执行, 所以顺序一旦调反, 惩罚就永远读成 0.
+function councilExtraEnemies() {
+  const n = COUNCIL.extraEnemies;
+  COUNCIL.extraEnemies = 0;
+  return n;
+}
+
+function init() {
+  canvas = document.getElementById('game'); ctx = canvas.getContext('2d');
+  const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; layoutB(); };
+  resize();
+  window.addEventListener('resize', resize);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') input.left = true;
+    if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') input.right = true;
+    if (e.key === ' ' || e.key === 'w' || e.key === 'W' || e.key === 'ArrowUp') { input.jump = true; if (player && player.alive) player.jump(); }
+    if (e.key === 'j' || e.key === 'J' || e.key === 'k' || e.key === 'K') { if (player && player.alive) player.dash(); }
+    if (e.key === 'e' || e.key === 'E') input.shoot = true;   // 火焰远程射击(统一走 input.shoot)
+    if (e.key === 'm' || e.key === 'M') { if (typeof SFX_HOOK !== 'undefined') SFX_HOOK.toggle(); }
+    if (state === 'gameover' && (e.key === ' ' || e.key === 'Enter')) startGame();
+  });
+  document.addEventListener('keyup', e => {
+    if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') input.left = false;
+    if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') input.right = false;
+    if (e.key === ' ' || e.key === 'w' || e.key === 'W' || e.key === 'ArrowUp') input.jump = false;
+  });
+  window.addEventListener('blur', () => { input.left = false; input.right = false; input.jump = false; });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { input.left = false; input.right = false; input.jump = false; } });
+  // 静音按钮: 触屏点它(命中区比画出来的圆略大, 手指好点)
+  canvas.addEventListener('touchstart', (e) => {
+    const t0 = e.changedTouches && e.changedTouches[0];
+    if (!t0) return;
+    const dx = t0.clientX - MUTE_BTN.x, dy = t0.clientY - MUTE_BTN.y;
+    if (dx * dx + dy * dy <= (MUTE_BTN.r + 12) * (MUTE_BTN.r + 12)) {
+      if (typeof SFX_HOOK !== 'undefined') SFX_HOOK.toggle();
+      e.preventDefault(); e.stopPropagation();
+    }
+  }, { passive: false, capture: true });
+  canvas.addEventListener('touchstart', ts, { passive: false });
+  canvas.addEventListener('touchmove', tm2, { passive: false });
+  canvas.addEventListener('touchend', te, { passive: false });
+  canvas.addEventListener('touchcancel', te, { passive: false });
+  startGame();
+  requestAnimationFrame(loop);
+}
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  // 下界钳到 0: rAF 的 now 偶尔回退(切标签页/锁屏回来), 负 dt 会让所有倒计时反向
+  const dt = Math.max(0, Math.min((now - lastTime) / 1000, 0.1));
+  lastTime = now;
+  ctx.fillStyle = scene === 'dungeon' ? COLORS.dbg : COLORS.bg;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (state === 'playing') {
+    // 注意: loopEnemiesAtFrameStart 在帧末才更新(见本函数末尾), 这里不能再覆盖一次,
+    // 否则"判定时读到的是两帧前的敌人数", 刚清完一圈那一帧会被漏判
+    if (timeStopTimer > 0) timeStopTimer -= dt;   // 时停倒计时
+    player.update(dt);
+    // 连踩: 一落地就清零(只有空中连续踩怪才累积倍率)
+    if (player.onGround && player.airCombo > 0) player.airCombo = 0;
+    // 玩家附近刷新道具: 每移动一段距离补刷一个(保证走到哪都有道具)
+    nearSpD += Math.abs(player.vx) * dt;
+    if (nearSpD > 240) { nearSpD = 0; spawnNearItem(); }
+    for (const e of enemies) e.update(dt);
+    updateFire(dt);
+    updateHitFx(dt);
+    if (typeof councilUpdate === 'function') councilUpdate(dt);
+    for (const it of items) it.update(dt);
+    if (dragon && dragon.alive) dragon.update(dt);
+    if (scene === 'world') for (const b of boxes) b.update();
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      const _ix = it.x; it.x = wrapToPlayer(it.x);   // 对齐到玩家当前圈再判定拾取
+      const hit = playerHits(it);
+      it.x = _ix;
+      if (hit) {
+        if (it.type === 'heal') player.hp = Math.min(player.maxHp, player.hp + 1);
+        else if (it.type === 'power') player.powerTimer = POWER_DURATION;
+        else if (it.type === 'timeStop') timeStopTimer = 5;   // 时停5秒
+        else if (it.type === 'swordDash') player.hasDash = true;   // 获得冲刺能力
+        else if (it.type === 'fireSkill') { player.hasFire = true; if (typeof loopStats !== 'undefined') loopStats.fire++; }   // 获得火焰远程技能
+        if (it.type !== 'timeStop' && it.type !== 'swordDash' && it.type !== 'fireSkill') refillAfterPickup(it.type);
+        sfx(it.type === 'heal' || it.type === 'power' ? 'pickup' : 'special');
+        items.splice(i, 1);
+      }
+    }
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      const e = enemies[i];
+      if (!playerHits(e)) continue;
+      // 冲刺中: 突进伤害(持续整个冲刺过程, 但带短冷却防同一只怪被连秒), 冲刺无敌不受反伤
+      if (player.dashT > 0) {
+        // 冲刺伤害用独立 CD(原来复用 hitFlash, 打断受击白闪的节奏), 且不再直接 continue:
+        // 原来冲刺期间完全跳过踩踏/受伤判定, 玩家被"钉"在怪头顶来回贴, 冲刺一结束立刻掉血.
+        if (e.dashHitCd <= 0) { damageEnemy(e); e.dashHitCd = FEEL.dashHitCd; }
+      }
+      if (checkStomp(e)) {
+        damageEnemy(e, true);   // true = 踩踏命中, 累计连踩
+        player.vy = JUMP * FEEL.stompBounce;   // 回弹(手感调出来的)
+        player.y = e.y - player.h - 1;
+        player.airHopsLeft = FEEL.airHops;     // 踩怪回弹相当于重新离地: 补满滞空次数
+        player.airTime = 0;
+        player.stompInvuln = STOMP_INVULN;
+        continue;
+      }
+      if (player.stompInvuln > 0) continue;
+      // 只有玩家确实从怪的中下/侧下半部撞入才受伤(避免顶部半压误伤)
+      if (player.y + player.h >= e.y + e.h * 0.45) player.hurt(e.x + e.w / 2);
+    }
+    if (dragon && dragon.alive) {
+      // 龙头判定框对齐视觉(视觉约116×76), 中心seg[0], 参数见 Dragon.headHalfW/H
+      const dh = dragon.seg[0];
+      const hh = dragon.headHalfH;
+      const headTop = dh.y - hh;                       // 龙头顶y
+      const playerBottom = player.y + player.h;        // 玩家底边
+      // 左右区间: 龙头中心±headHalfW
+      const lhs = dragon.seg[0].x - dragon.headHalfW, rhs = dragon.seg[0].x + dragon.headHalfW;
+      const horiz = player.x + player.w > lhs && player.x < rhs;
+      // 上方判定: 玩家底边在"头顶上方一点"到"头顶下方一点"范围内
+      const aboveBand = playerBottom >= headTop - 24 && playerBottom <= headTop + 8;
+      // 冷却: 踩中后 stompCd 秒内不再重复扣血,防止无限跳连踩秒杀
+      if (horiz && aboveBand && dragon.stompCd <= 0) {
+        dragon.stompCd = FEEL.dragonStompCd; // 踩头冷却
+        dragon.hp -= player.powerTimer > 0 ? 100 : 50;
+        dragon.hitFlash = 0.15;
+        player.vy = -12;
+        player.y = headTop - player.h - 1;
+        player.airHopsLeft = FEEL.airHops;     // 踩头回弹同样补满滞空次数
+        player.airTime = 0;
+        player.stompInvuln = STOMP_INVULN;
+        if (dragon.hp <= 0) { dragon.alive = false; score += 5000; }
+      } else if (horiz && playerBottom > headTop + 8 && player.stompInvuln <= 0) {
+        // 从侧下碰到龙头身: 扣玩家血
+        player.hurt(dragon.seg[0].x);
+      }
+    }
+    resolveEnemyCollisions();   // 伤害判定结束后再做物理分离, 避免推开抢先阻止贴怪掉血
+    // 副本里确实交过手(玩家出了手, 或者怪追上了你)才把"清空副本"算数
+    if (scene === 'dungeon' && !dungeonFightSeen) {
+      if (player.invuln > 0 || player.dashT > 0 || (player.fireCd !== undefined && player.fireCd > 0)) dungeonFightSeen = true;
+      else { for (const e of enemies) { if (e.locked || e.state !== 'IDLE') { dungeonFightSeen = true; break; } } }
+    }
+    // 只在"这一帧确实把敌人打光"时清圈(进入本帧时还有怪, 结束时没了), 防止每帧重复触发
+    // (这个变量必须在"判定之后、帧末"更新: 原来在帧首更新, 等于比较的是两帧前 vs 现在)
+    if (scene === 'world' && loopEnemiesAtFrameStart > 0 && enemies.length === 0) checkLoopComplete();
+    if (state === 'playing') loopEnemiesAtFrameStart = enemies.length;
+  }
+  const tgt = camTarget();
+  const a = 1 - Math.exp(-10 * dt);
+  camX += (tgt.x - camX) * a;
+  camY += (tgt.y - camY) * a;
+  if (scene === 'world') { drawWorldMap(camX, camY); drawPatrolZone(camX, camY); drawPlatforms(camX, camY); drawTreesOnMap(camX, camY); }
+  else drawDungeonMap(camX, camY);
+  if (scene === 'world') for (const b of boxes) { const _x=b.x; b.x=wrapToPlayer(b.x); b.draw(camX,camY); b.x=_x; }
+  for (const it of items) { const _x=it.x; it.x=wrapToPlayer(it.x); it.draw(camX,camY); it.x=_x; }
+  for (const e of enemies) e.draw(camX, camY);
+  drawFire(camX, camY);
+  if (dragon && dragon.alive) dragon.draw(camX, camY);
+  player.draw(camX, camY);
+  drawHitFx(camX, camY);
+  drawHUD(); drawMinimap(); drawB();
+  if (state === 'gameover') {
+    ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 32px Courier New'; ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 30);
+    ctx.font = '18px Courier New';
+    ctx.fillText('到达圈数: ' + loopCount, canvas.width / 2, canvas.height / 2 + 5);
+    ctx.fillText('最终得分: ' + score, canvas.width / 2, canvas.height / 2 + 30);
+    ctx.font = '16px Courier New';
+    ctx.fillText('按空格或点击屏幕重新开始', canvas.width / 2, canvas.height / 2 + 65);
+    ctx.textAlign = 'left';
+  }
+}
+// 启动入口在 boot.js(由外部的 script 标签加载)
+</script>
+<script>
+/* ---------- boot.js ---------- */
+// ============================================================================
+// boot.js — 启动入口: 显式写出"先加载类, 再启动"的顺序
+//   1) physics.js(Ent) 2) player/enemy/dragon/item/box 3) 引擎 4) 本文件
+// 依赖(引擎注入): init()
+// ============================================================================
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();   // 脚本在 body 末尾执行时, canvas 已就绪, 直接启动
+}
+</script>
+</body>
+</html>
